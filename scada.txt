@@ -1,0 +1,352 @@
+dass-datawarehouse/src/main/resources/scada.txt
+
+
+DROP INDEX IF EXISTS das_new_pm.idx_algorithm;
+DROP INDEX IF EXISTS das_new_pm.idx_plant_id;
+DROP INDEX IF EXISTS das_new_pm.idx_worktation_no;
+DROP INDEX IF EXISTS das_new_pm.idx_workcenter_no;
+DROP INDEX IF EXISTS das_new_pm.idx_output_stock_no;
+DROP INDEX IF EXISTS das_new_pm.idx_customer;
+DROP INDEX IF EXISTS das_new_pm.idx_job_order_reference_no;
+DROP INDEX IF EXISTS das_new_pm.idx_prod_order_reference_no;
+DROP INDEX IF EXISTS das_new_pm.idx_proces_no;
+
+DROP TABLE das_new_pm.scada_correlation_matrix;
+
+CREATE TABLE IF NOT EXISTS das_new_pm.scada_correlation_matrix (
+    proces_no text,
+    partition_date timestamp,
+    customer text,
+    correlation_data frozen<list<frozen<map<text, frozen<map<text, double>>>>>>,
+    operator_name text,
+    operator_no text,
+    output_stock_no text,
+    output_stock_name text,
+    job_order_reference_no text,
+    prod_order_reference_no text,
+    plant_id int,
+    workcenter_name text,
+    workcenter_no text,
+    workstation_name text,
+    workstation_no text,
+    algorithm text,
+    PRIMARY KEY ((prod_order_reference_no), partition_date)
+) WITH CLUSTERING ORDER BY (partition_date DESC);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_algorithm ON das_new_pm.scada_correlation_matrix (algorithm);
+CREATE INDEX IF NOT EXISTS idx_plant_id ON das_new_pm.scada_correlation_matrix (plant_id);
+CREATE INDEX IF NOT EXISTS idx_workstation_no ON das_new_pm.scada_correlation_matrix (workstation_no);
+CREATE INDEX IF NOT EXISTS idx_workcenter_no ON das_new_pm.scada_correlation_matrix (workcenter_no);
+CREATE INDEX IF NOT EXISTS idx_output_stock_no ON das_new_pm.scada_correlation_matrix (output_stock_no);
+CREATE INDEX IF NOT EXISTS idx_customer ON das_new_pm.scada_correlation_matrix (customer);
+CREATE INDEX IF NOT EXISTS idx_job_order_reference_no ON das_new_pm.scada_correlation_matrix (job_order_reference_no);
+CREATE INDEX IF NOT EXISTS idx_prod_order_reference_no ON das_new_pm.scada_correlation_matrix (prod_order_reference_no);
+CREATE INDEX IF NOT EXISTS idx_proces_no ON das_new_pm.scada_correlation_matrix (proces_no);
+
+***************************************************************************************************************
+
+DROP INDEX IF EXISTS das_new_pm.idx_summary_algorithm;
+DROP INDEX IF EXISTS das_new_pm.idx_summary_plant_id;
+DROP INDEX IF EXISTS das_new_pm.idx_summary_workcenter_no;
+DROP INDEX IF EXISTS das_new_pm.idx_summary_customer;
+
+-- Then drop the table
+DROP TABLE IF EXISTS das_new_pm.scada_correlation_matrix_summary;
+
+CREATE TABLE IF NOT EXISTS das_new_pm.scada_correlation_matrix_summary (
+    output_stock_no text,
+    partition_date timestamp,
+    correlation_data frozen<list<frozen<map<text, frozen<map<text, double>>>>>>,
+    customer text,
+    operator_name text,
+    operator_no text,
+    output_stock_name text,
+    plant_id int,
+    workcenter_name text,
+    workcenter_no text,
+    workstation_name text,
+    workstation_no text,
+    algorithm text,
+    PRIMARY KEY ((output_stock_no, workstation_no), partition_date, algorithm)
+) WITH CLUSTERING ORDER BY (partition_date DESC);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_summary_algorithm ON das_new_pm.scada_correlation_matrix_summary (algorithm);
+CREATE INDEX IF NOT EXISTS idx_summary_plant_id ON das_new_pm.scada_correlation_matrix_summary (plant_id); 
+CREATE INDEX IF NOT EXISTS idx_summary_workcenter_no ON das_new_pm.scada_correlation_matrix_summary (workcenter_no);
+CREATE INDEX IF NOT EXISTS idx_summary_customer ON das_new_pm.scada_correlation_matrix_summary (customer);
+
+***************************************************************************************************************
+
+DROP INDEX IF EXISTS das_new_pm.idx_fi_algorithm;
+DROP INDEX IF EXISTS das_new_pm.idx_fi_plant_id;
+DROP INDEX IF EXISTS das_new_pm.idx_fi_worktation_no;
+DROP INDEX IF EXISTS das_new_pm.idx_fi_workcenter_no;
+DROP INDEX IF EXISTS das_new_pm.idx_fi_output_stock_no;
+DROP INDEX IF EXISTS das_new_pm.idx_fi_customer;
+DROP INDEX IF EXISTS das_new_pm.idx_fi_job_order_reference_no;
+DROP INDEX IF EXISTS das_new_pm.idx_fi_prod_order_reference_no;
+DROP INDEX IF EXISTS das_new_pm.idx_fi_proces_no;
+
+DROP TABLE IF EXISTS das_new_pm.scada_feature_importance_values;
+
+CREATE TABLE IF NOT EXISTS das_new_pm.scada_feature_importance_values (
+    proces_no text,
+    partition_key text,
+    partition_date timestamp,
+    customer text,
+    feature_importance_input_value map<text, frozen<map<text, double>>>,
+	feature_importance_output_value map<text, frozen<map<text, double>>>,
+    job_order_reference_no text,
+    prod_order_reference_no text,
+    operator_name text,
+    operator_no text,
+    output_stock_name text,
+    output_stock_no text,
+    plant_id text, 
+    workcenter_name text,
+    workcenter_no text,
+    workstation_name text,
+    workstation_no text,
+    algorithm text,
+    PRIMARY KEY ((prod_order_reference_no), partition_date)
+) WITH CLUSTERING ORDER BY (partition_date DESC);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_fi_algorithm 
+    ON das_new_pm.scada_feature_importance_values (algorithm);
+
+CREATE INDEX IF NOT EXISTS idx_fi_plant_id 
+    ON das_new_pm.scada_feature_importance_values (plant_id);
+
+CREATE INDEX IF NOT EXISTS idx_fi_workstation_no 
+    ON das_new_pm.scada_feature_importance_values (workstation_no);
+
+CREATE INDEX IF NOT EXISTS idx_fi_workcenter_no 
+    ON das_new_pm.scada_feature_importance_values (workcenter_no);
+
+CREATE INDEX IF NOT EXISTS idx_fi_output_stock_no 
+    ON das_new_pm.scada_feature_importance_values (output_stock_no);
+
+CREATE INDEX IF NOT EXISTS idx_fi_customer 
+    ON das_new_pm.scada_feature_importance_values (customer);
+
+CREATE INDEX IF NOT EXISTS idx_fi_job_order_reference_no 
+    ON das_new_pm.scada_feature_importance_values (job_order_reference_no);
+
+CREATE INDEX IF NOT EXISTS idx_fi_proces_no 
+    ON das_new_pm.scada_feature_importance_values (proces_no);
+
+**************************************************************************************************************
+DROP INDEX IF EXISTS das_new_pm.idx_fis_summary_algorithm;
+DROP INDEX IF EXISTS das_new_pm.idx_fis_summary_plant_id;
+DROP INDEX IF EXISTS das_new_pm.idx_fis_summary_workcenter_no;
+DROP INDEX IF EXISTS das_new_pm.idx_fis_summary_customer;
+
+DROP TABLE IF EXISTS das_new_pm.scada_feature_importance_values_summary;
+
+CREATE TABLE IF NOT EXISTS das_new_pm.scada_feature_importance_values_summary (
+    output_stock_no text,
+    partition_key text,
+    partition_date timestamp,
+    customer text, 
+	feature_importance_input_value map<text, frozen<map<text, double>>>,
+    feature_importance_output_value map<text, frozen<map<text, double>>>,
+
+    operator_name text,
+    operator_no text,
+    output_stock_name text,
+    plant_id text, 
+    workcenter_name text,
+    workcenter_no text,
+    workstation_name text,
+    workstation_no text,
+    algorithm text,
+    PRIMARY KEY ((output_stock_no, workstation_no), partition_date,algorithm)
+) WITH CLUSTERING ORDER BY (partition_date DESC);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_fis_summary_algorithm 
+    ON das_new_pm.scada_feature_importance_values_summary (algorithm);
+
+CREATE INDEX IF NOT EXISTS idx_fis_summary_plant_id 
+    ON das_new_pm.scada_feature_importance_values_summary (plant_id);
+ 
+CREATE INDEX IF NOT EXISTS idx_fis_summary_workcenter_no 
+    ON das_new_pm.scada_feature_importance_values_summary (workcenter_no);
+
+CREATE INDEX IF NOT EXISTS idx_fis_summary_customer 
+    ON das_new_pm.scada_feature_importance_values_summary (customer);
+
+**************************************************************************************************************
+DROP INDEX IF EXISTS das_new_pm.idx_rtp_algorithm;
+DROP INDEX IF EXISTS das_new_pm.idx_rtp_plant_id;
+DROP INDEX IF EXISTS das_new_pm.idx_rtp_worktation_no;
+DROP INDEX IF EXISTS das_new_pm.idx_rtp_workcenter_no;
+DROP INDEX IF EXISTS das_new_pm.idx_rtp_output_stock_no;
+DROP INDEX IF EXISTS das_new_pm.idx_rtp_customer;
+DROP INDEX IF EXISTS das_new_pm.idx_rtp_job_order_reference_no;
+DROP INDEX IF EXISTS das_new_pm.idx_rtp_prod_order_reference_no;
+DROP INDEX IF EXISTS das_new_pm.idx_rtp_process_no;
+
+DROP TABLE IF EXISTS das_new_pm.scada_real_time_predictions;
+
+CREATE TABLE IF NOT EXISTS das_new_pm.scada_real_time_predictions (
+    process_no text,
+    partition_date timestamp,
+    current_ts timestamp,
+    customer text, 
+
+    input_predicted_values map<text, frozen<map<text, double>>>,  -- mean, actual, predicted
+    job_order_reference_no text,
+    prod_order_reference_no text,
+    operator_name text,
+    operator_no text, 
+
+    output_predicted_values map<text, frozen<map<text, double>>>,
+    output_stock_name text,
+    output_stock_no text,
+    plant_id text, 
+    start_date timestamp,
+
+    workcenter_name text,
+    workcenter_no text,
+    workstation_name text,
+    workstation_no text,
+    algorithm text,
+
+    PRIMARY KEY ((prod_order_reference_no), partition_date)
+) WITH CLUSTERING ORDER BY (partition_date DESC);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_rtp_algorithm 
+    ON das_new_pm.scada_real_time_predictions (algorithm);
+
+CREATE INDEX IF NOT EXISTS idx_rtp_plant_id 
+    ON das_new_pm.scada_real_time_predictions (plant_id);
+
+CREATE INDEX IF NOT EXISTS idx_rtp_workstation_no 
+    ON das_new_pm.scada_real_time_predictions (workstation_no);
+
+CREATE INDEX IF NOT EXISTS idx_rtp_workcenter_no 
+    ON das_new_pm.scada_real_time_predictions (workcenter_no);
+
+CREATE INDEX IF NOT EXISTS idx_rtp_output_stock_no 
+    ON das_new_pm.scada_real_time_predictions (output_stock_no);
+
+CREATE INDEX IF NOT EXISTS idx_rtp_customer 
+    ON das_new_pm.scada_real_time_predictions (customer);
+
+CREATE INDEX IF NOT EXISTS idx_rtp_job_order_reference_no
+    ON das_new_pm.scada_real_time_predictions (job_order_reference_no);
+
+CREATE INDEX IF NOT EXISTS idx_rtp_process_no
+    ON das_new_pm.scada_real_time_predictions (process_no);
+
+***************************************************************************************
+
+DROP INDEX IF EXISTS das_new_pm.idx_rtps_summary_algorithm;
+DROP INDEX IF EXISTS das_new_pm.idx_rtps_summary_plant_id;
+DROP INDEX IF EXISTS das_new_pm.idx_rtps_summary_workcenter_no;
+DROP INDEX IF EXISTS das_new_pm.idx_rtps_summary_customer;
+
+DROP TABLE IF EXISTS das_new_pm.scada_real_time_prediction_summary;
+
+CREATE TABLE IF NOT EXISTS das_new_pm.scada_real_time_prediction_summary (
+    output_stock_no text,
+    workstation_no text,
+    partition_date timestamp,
+    current_ts timestamp,
+    customer text, 
+
+    input_predicted_values map<text, frozen<map<text, double>>>,  -- mean, actual, predicted
+    operator_name text,
+    operator_no text, 
+
+    output_predicted_values map<text, frozen<map<text, double>>>,
+    output_stock_name text,
+    plant_id text, 
+    start_date timestamp,
+
+    workcenter_name text,
+    workcenter_no text,
+    workstation_name text,
+    algorithm text,
+
+    PRIMARY KEY ((output_stock_no, workstation_no), partition_date)
+) WITH CLUSTERING ORDER BY (partition_date DESC);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_rtps_summary_algorithm 
+    ON das_new_pm.scada_real_time_prediction_summary (algorithm);
+
+CREATE INDEX IF NOT EXISTS idx_rtps_summary_plant_id 
+    ON das_new_pm.scada_real_time_prediction_summary (plant_id);
+
+CREATE INDEX IF NOT EXISTS idx_rtps_summary_workcenter_no 
+    ON das_new_pm.scada_real_time_prediction_summary (workcenter_no);
+
+CREATE INDEX IF NOT EXISTS idx_rtps_summary_customer 
+    ON das_new_pm.scada_real_time_prediction_summary (customer);
+
+
+***************************************************************************************
+
+
+DROP INDEX IF EXISTS das_new_pm.idx_set_partition_date;
+DROP INDEX IF EXISTS das_new_pm.idx_set_plant_id;
+DROP INDEX IF EXISTS das_new_pm.idx_set_workstation_no;
+DROP INDEX IF EXISTS das_new_pm.idx_set_workcenter_no;
+DROP INDEX IF EXISTS das_new_pm.idx_set_customer;
+DROP INDEX IF EXISTS das_new_pm.idx_set_update_date;
+DROP INDEX IF EXISTS das_new_pm.idx_set_create_date;
+DROP INDEX IF EXISTS das_new_pm.idx_set_active;
+DROP INDEX IF EXISTS das_new_pm.idx_set_correlation_algorithm;
+DROP INDEX IF EXISTS das_new_pm.idx_set_feature_importance_algorithm;
+DROP INDEX IF EXISTS das_new_pm.idx_set_prediction_algorithm;
+
+DROP TABLE das_new_pm.scada_settings;
+
+CREATE TABLE IF NOT EXISTS das_new_pm.scada_settings (
+    setting_id uuid PRIMARY KEY,
+    active boolean,
+    partition_date timestamp,
+    create_date timestamp,
+    update_date timestamp,
+    customer text,
+    plant_id int,
+    workcenter_name text,
+    workcenter_no text,
+    workstation_name text,
+    workstation_no text,
+    correlation_algorithm text,
+    feature_importance_algorithm text,
+    prediction_algorithm text,
+    train_epochs int,
+    train_min_points int,
+    train_batch_size int,
+    train_lookback int,
+    fi_n_estimators int
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_set_partition_date ON das_new_pm.scada_settings (partition_date);
+CREATE INDEX IF NOT EXISTS idx_set_plant_id ON das_new_pm.scada_settings (plant_id);
+CREATE INDEX IF NOT EXISTS idx_set_workstation_no ON das_new_pm.scada_settings (workstation_no);
+CREATE INDEX IF NOT EXISTS idx_set_workcenter_no ON das_new_pm.scada_settings (workcenter_no);
+CREATE INDEX IF NOT EXISTS idx_set_customer ON das_new_pm.scada_settings (customer);
+CREATE INDEX IF NOT EXISTS idx_set_update_date ON das_new_pm.scada_settings (update_date);
+CREATE INDEX IF NOT EXISTS idx_set_create_date ON das_new_pm.scada_settings (create_date);
+CREATE INDEX IF NOT EXISTS idx_set_active ON das_new_pm.scada_settings (active);
+CREATE INDEX IF NOT EXISTS idx_set_correlation_algorithm ON das_new_pm.scada_settings (correlation_algorithm);
+CREATE INDEX IF NOT EXISTS idx_set_feature_importance_algorithm ON das_new_pm.scada_settings (feature_importance_algorithm);
+CREATE INDEX IF NOT EXISTS idx_set_prediction_algorithm ON das_new_pm.scada_settings (prediction_algorithm);
+
+-------------------------------------
+
+params map<text, text>  -----???
+
+
+
+
