@@ -1,0 +1,920 @@
+old and true p1 anomalies
+
+CREATE TABLE dw_tbl_anomalies (
+    active boolean,
+    anomaly int,
+    anomaly_detection_active boolean,
+    anomaly_importance double,
+    sensor_value double,
+    create_auto_maintenance_order_notification boolean,
+    create_date timestamp,
+    current_quantity_changed int,
+    customer text,
+    equipment_id int,
+    equipment_name text,
+    equipment_no text,
+    good boolean,
+    current_quantity double,
+    jobOrderReferenceNo text,
+    job_order_operation_id int,
+    machine_state text,
+    measurement_date timestamp,
+    message_key text,
+    operationName text,
+    operationNo text,
+    operationTaskCode text,
+    production_order_ref_id text,
+    outputValueList list<frozen<map<text, text>>>,
+    partition_date text,
+    partition_key text,
+    plant_id int,
+    plant_name text,
+    predicted_lower double,
+    predicted_upper double,
+    predicted_value double,
+    producedList list<frozen<map<text, text>>>,
+    produced_stock_id int,
+    produced_stock_name text,
+    produced_stock_no text,
+    productionState text,
+    quantity_changed int,
+    shiftId int,
+    shiftName text,
+    shift_finish_text text,
+    shift_finish_time timestamp,
+    shift_start_text text,
+    shift_start_time timestamp,
+    trend double,
+    trend_calculation_active boolean,
+    trend_lower double,
+    trend_upper double,
+    unique_code text,
+    work_center_id int,
+    work_center_name text,
+    work_center_no text,
+    workstation_id int,
+    workstation_name text,
+    workstation_no text,
+    workstation_state text,
+    algorithm text,
+    PRIMARY KEY ((partition_date), measurement_date, unique_code)
+) WITH CLUSTERING ORDER BY (measurement_date DESC);
+ 
+CREATE INDEX ON dw_tbl_anomalies (customer);
+CREATE INDEX ON dw_tbl_anomalies (plant_id);
+CREATE INDEX ON dw_tbl_anomalies (produced_stock_id);
+CREATE INDEX ON dw_tbl_anomalies (equipment_id);
+CREATE INDEX ON dw_tbl_anomalies (job_order_operation_id);
+CREATE INDEX ON dw_tbl_anomalies (workstation_id);
+CREATE INDEX ON dw_tbl_anomalies (work_center_id);
+CREATE INDEX ON dw_tbl_anomalies (good);
+CREATE INDEX ON dw_tbl_anomalies (quantity_changed);
+CREATE INDEX ON dw_tbl_anomalies (algorithm);
+
+-------------------------------------------------------
+
+CREATE TABLE dw_tbl_anomalies (
+    active boolean,
+    anomaly int,
+    anomaly_detection_active boolean,
+    anomaly_importance double,
+    sensor_value double,
+    create_auto_maintenance_order_notification boolean,
+    current_quantity_changed int,
+    customer text,
+    equipment_id int,
+    equipment_name text,
+    equipment_no text,
+    good boolean,
+    current_quantity double,
+    jobOrderReferenceNo text,
+    job_order_operation_id int,
+    machine_state text,
+    measurement_date timestamp,
+    message_key text,
+    operationName text,
+    operationNo text,
+    operationTaskCode text,
+    production_order_ref_id text,
+    outputValueList list<frozen<map<text, text>>>,
+    partition_date text,
+    partition_key text,
+    plant_id int,
+    plant_name text,
+    predicted_lower double,
+    predicted_upper double,
+    predicted_value double,
+    producedList list<frozen<map<text, text>>>,
+    produced_stock_id int,
+    produced_stock_name text,
+    produced_stock_no text,
+    productionState text,
+    quantity_changed int,
+    shiftId int,
+    shiftName text,
+    shift_finish_text text,
+    shift_finish_time timestamp,
+    shift_start_text text,
+    shift_start_time timestamp,
+    trend double,
+    trend_calculation_active boolean,
+    trend_lower double,
+    trend_upper double,
+    unique_code text,
+    work_center_id int,
+    work_center_name text,
+    work_center_no text,
+    workstation_id int,
+    workstation_name text,
+    workstation_no text,
+    workstation_state text,
+    algorithm text,
+    PRIMARY KEY ((partition_date), measurement_date, unique_code)
+) WITH CLUSTERING ORDER BY (measurement_date DESC);
+ 
+CREATE INDEX ON dw_tbl_anomalies (customer);
+CREATE INDEX ON dw_tbl_anomalies (plant_id);
+CREATE INDEX ON dw_tbl_anomalies (produced_stock_id);
+CREATE INDEX ON dw_tbl_anomalies (equipment_id);
+CREATE INDEX ON dw_tbl_anomalies (job_order_operation_id);
+CREATE INDEX ON dw_tbl_anomalies (workstation_id);
+CREATE INDEX ON dw_tbl_anomalies (work_center_id);
+CREATE INDEX ON dw_tbl_anomalies (good);
+CREATE INDEX ON dw_tbl_anomalies (quantity_changed);
+CREATE INDEX ON dw_tbl_anomalies (algorithm);
+
+
+-------------------------------------------------------
+
+ 
+DROP INDEX IF EXISTS das_new_pm.dw_raw_data_good_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_raw_data_joborderoperationrefid_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_raw_data_outputstockid_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_raw_data_plantid_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_raw_data_prodorderoperationrefid_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_raw_data_quantitychanged_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_raw_data_unique_code_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_raw_data_workcenterid_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_raw_data_workstationid_idx;
+
+DROP TABLE IF EXISTS das_new_pm.dw_raw_data;
+
+CREATE TABLE dw_raw_data (
+    componentBatchList list<frozen<map<text, text>>>,
+    measurement_date timestamp, 
+    anomalyDetectionActive boolean,
+    good boolean,
+    quantityChanged int,
+    currentQuantity int,
+    inputVariableList list<frozen<map<text, text>>>,
+    jobOrderOperationId int,
+    jobOrderOperationRefId text,
+    prodOrderOperationRefId text,
+    machineState text,
+    operationName text,
+    operationNo text,
+    operationTaskCode text,
+    prodOrderRefId text,
+    outputValueList list<frozen<map<text, text>>>,
+    partition_key text,
+    plantId int,
+    plantName text,
+    produceList list<frozen<map<text, text>>>,
+    productionState text,
+    qualityCheckList list<frozen<map<text, text>>>,
+    shiftFinishTime timestamp,
+    shiftId int,
+    outputStockId int,
+    shiftName text,
+    shiftStartTime timestamp,
+    unique_code uuid,
+    workCenterId int,
+    workCenterName text,
+    workCenterNo text,
+    workStationId int,
+    workStationName text,
+    workStationNo text,
+    workstationState text,
+    PRIMARY KEY (partition_key, measurement_date)
+) WITH CLUSTERING ORDER BY (measurement_date DESC);
+ 
+ 
+-- Optional secondary indexes
+CREATE INDEX IF NOT EXISTS ON dw_raw_data (plantId);
+CREATE INDEX IF NOT EXISTS ON dw_raw_data (workStationId);
+CREATE INDEX IF NOT EXISTS ON dw_raw_data (jobOrderOperationRefId);
+CREATE INDEX IF NOT EXISTS ON dw_raw_data (jobOrderReferenceNo);
+CREATE INDEX IF NOT EXISTS ON dw_raw_data (workCenterId);
+CREATE INDEX IF NOT EXISTS ON dw_raw_data (unique_code);
+CREATE INDEX IF NOT EXISTS ON dw_raw_data (workStationId);
+CREATE INDEX IF NOT EXISTS ON dw_raw_data (outputStockId);
+CREATE INDEX IF NOT EXISTS ON dw_raw_data (good);
+CREATE INDEX IF NOT EXISTS ON dw_raw_data (quantityChanged);
+CREATE INDEX IF NOT EXISTS ON dw_raw_data (prodOrderOperationRefId);
+
+
+----------------------------------------------
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_raw_data_job_order_operation_id_idx;
+
+DROP INDEX IF EXISTS das_new_pm.index_dw_create_date;
+
+DROP INDEX IF EXISTS das_new_pm.index_dw_customer;
+
+DROP INDEX IF EXISTS das_new_pm.index_dw_plant_id;
+
+DROP INDEX IF EXISTS das_new_pm.index_dw_workcenter_name;
+
+DROP INDEX IF EXISTS das_new_pm.index_dw_workcenter_no;
+
+DROP INDEX IF EXISTS das_new_pm.index_machine_state;
+
+DROP INDEX IF EXISTS das_new_pm.index_work_station_id;
+
+DROP INDEX IF EXISTS das_new_pm.index_workstation_name;
+
+DROP INDEX IF EXISTS das_new_pm.index_workstation_no;
+
+DROP INDEX IF EXISTS das_new_pm.produced_stock_id_idx;
+
+DROP INDEX IF EXISTS das_new_pm.job_order_reference_no_idx;
+
+DROP INDEX IF EXISTS das_new_pm.prod_order_reference_no_idx;
+
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_raw_data_job_order_operation_id_idx;
+
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_raw_data_operationTaskCode_idx;
+
+DROP TABLE IF EXISTS das_new_pm.dw_tbl_raw_data;
+
+CREATE TABLE das_new_pm.dw_tbl_raw_data (
+    active boolean,
+    anomaly_detection_active boolean,
+    good boolean,
+    counter_reading double,
+    gen_read_val double,
+    create_date timestamp,
+    customer text,
+    equipment_id int,
+    equipment_name text,
+    equipment_no text,
+    equipment_type boolean,
+    job_order_operation_id int,
+    job_order_reference_no text,
+    prod_order_reference_no text,
+    machine_state text,
+    measurement_date timestamp,
+    operationName text,
+    operationNo text,
+    operationTaskCode text,
+    plant_id int,
+    plant_name text,
+    produced_stock_id int,
+    produced_stock_name text,
+    produced_stock_no text,
+    shift_finish_time timestamp,
+    shift_start_time timestamp,
+    stock_id int,
+    trend_calculation_active boolean,
+    unique_code text,
+    update_date timestamp,
+    valuation_code text,
+    work_center_id int,
+    work_center_name text,
+    work_center_no text,
+    work_station_id int,
+    work_station_name text,
+    work_station_no text,
+    workstation_state text,
+    year text,
+    PRIMARY KEY (unique_code)
+);
+
+
+CREATE INDEX dw_tbl_raw_data_job_order_operation_id_idx
+ON das_new_pm.dw_tbl_raw_data (job_order_operation_id);
+
+CREATE INDEX index_dw_create_date
+ON das_new_pm.dw_tbl_raw_data (create_date);
+
+CREATE INDEX index_dw_customer
+ON das_new_pm.dw_tbl_raw_data (customer);
+
+CREATE INDEX index_dw_plant_id
+ON das_new_pm.dw_tbl_raw_data (plant_id);
+
+CREATE INDEX index_dw_workcenter_name
+ON das_new_pm.dw_tbl_raw_data (work_center_name);
+
+CREATE INDEX index_dw_workcenter_no
+ON das_new_pm.dw_tbl_raw_data (work_center_no);
+
+CREATE INDEX index_machine_state
+ON das_new_pm.dw_tbl_raw_data (machine_state);
+
+CREATE INDEX index_work_station_id
+ON das_new_pm.dw_tbl_raw_data (work_station_id);
+
+CREATE INDEX index_workstation_name
+ON das_new_pm.dw_tbl_raw_data (work_station_name);
+
+CREATE INDEX index_workstation_no
+ON das_new_pm.dw_tbl_raw_data (work_station_no);
+
+CREATE INDEX produced_stock_id_idx
+ON das_new_pm.dw_tbl_raw_data (produced_stock_id);
+
+CREATE INDEX job_order_reference_no_idx
+ON das_new_pm.dw_tbl_raw_data (job_order_reference_no);
+
+CREATE INDEX prod_order_reference_no_idx
+ON das_new_pm.dw_tbl_raw_data (prod_order_reference_no);
+
+CREATE INDEX operationTaskCode_idx
+ON das_new_pm.dw_tbl_raw_data (operationTaskCode);
+
+----------------------------------------------
+
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_algorithm_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_customer_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_good_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_job_order_operation_id_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_plant_id_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_produced_stock_id_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_production_order_ref_id_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_quantity_changed_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_workcenter_id_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_workstation_id_idx;
+
+DROP TABLE IF EXISTS dw_tbl_multiple_anomalies;
+
+CREATE TABLE dw_tbl_multiple_anomalies (
+    active boolean,
+    anomaly_importance double,
+    anomaly_score double,
+    anomaly_detected boolean,
+    customer text,
+    create_date timestamp,
+    employee_id int,
+    id uuid,
+    job_order_operation_id int,
+    job_order_operation_ref_id text,
+    machine_state text,
+    measurement_date timestamp,
+    message_key text,
+    plant_id int,
+    plant_name text,
+    plant_no text,
+    produced_stock_id int,
+    produced_stock_name text,
+    produced_stock_no text,
+    sensor_values map<text, frozen<map<text, text>>>,
+    input_variables map<text, frozen<map<text, text>>>,
+    shift_finish_text text,
+    shift_finish_time timestamp,
+    shift_start_text text,
+    shift_start_time timestamp,
+    workcenter_id int,
+    workcenter_name text,
+    workcenter_no text,
+    workstation_id int,
+    workstation_name text,
+    workstation_no text,
+    workstation_state text,
+    unique_code text,
+    heatmap map<text, frozen<map<text, text>>>,
+    heapmap_threshold double,
+    good boolean,
+    quantity_changed boolean,
+    current_quantity double,
+    algorithm text,
+    production_order_ref_id text,
+    partition_date text,
+    PRIMARY KEY ((production_order_ref_id), measurement_date)
+) WITH CLUSTERING ORDER BY (measurement_date DESC);
+ 
+CREATE INDEX ON dw_tbl_multiple_anomalies (customer);
+CREATE INDEX ON dw_tbl_multiple_anomalies (plant_id);
+CREATE INDEX ON dw_tbl_multiple_anomalies (produced_stock_id);
+CREATE INDEX ON dw_tbl_multiple_anomalies (equipment_id);
+CREATE INDEX ON dw_tbl_multiple_anomalies (job_order_operation_id);
+CREATE INDEX ON dw_tbl_multiple_anomalies (workstation_id);
+CREATE INDEX ON dw_tbl_multiple_anomalies (workcenter_id);
+CREATE INDEX ON dw_tbl_multiple_anomalies (good);
+CREATE INDEX ON dw_tbl_multiple_anomalies (quantity_changed);
+CREATE INDEX ON dw_tbl_multiple_anomalies (algorithm);
+
+----------------------------------------------
+
+DROP INDEX IF EXISTS das_new_pm.tbl_p2_one_minute_anomaly_algorithm_idx;
+DROP INDEX IF EXISTS das_new_pm.tbl_p2_one_minute_anomaly_customer_idx;
+DROP INDEX IF EXISTS das_new_pm.tbl_p2_one_minute_anomaly_equipment_id_idx;
+DROP INDEX IF EXISTS das_new_pm.tbl_p2_one_minute_anomaly_good_idx;
+DROP INDEX IF EXISTS das_new_pm.tbl_p2_one_minute_anomaly_job_order_operation_id_idx;
+DROP INDEX IF EXISTS das_new_pm.tbl_p2_one_minute_anomaly_plant_id_idx;
+DROP INDEX IF EXISTS das_new_pm.tbl_p2_one_minute_anomaly_produced_stock_id_idx;
+DROP INDEX IF EXISTS das_new_pm.tbl_p2_one_minute_anomaly_work_center_id_idx;
+DROP INDEX IF EXISTS das_new_pm.tbl_p2_one_minute_anomaly_work_station_id_idx;
+
+DROP TABLE IF EXISTS tbl_p2_one_minute_anomaly;
+
+
+CREATE TABLE IF NOT EXISTS tbl_p2_one_minute_anomaly (
+    -- NEW partition key
+    prod_order_reference_no text,
+
+    -- clustering key (as you requested)
+    measurement_date timestamp,
+
+    -- existing columns (from your screenshots)
+    partition_date text,
+    unique_code text,
+
+    active boolean,
+    algorithm text,
+    anomaly int,
+    anomaly_detection_active boolean,
+    anomaly_importance double,
+    anomaly_score double,
+
+    bias double,
+    coefficient double,
+    counter_reading double,
+
+    create_auto_maintenance_order_notification boolean,
+    create_date timestamp,
+    update_date timestamp,
+
+    customer text,
+    detected_anomaly double,
+    employee_id int,
+
+    equipment_code_group_header_id int,
+    equipment_id int,
+    equipment_measuring_point_id int,
+    equipment_name text,
+    equipment_no text,
+    
+    good double,
+
+    id uuid,
+
+    job_order_operation_id int,
+    machine_state text,
+
+    max_error_count_in_hour int,
+    max_error_count_in_min int,
+    max_error_count_in_shift int,
+
+    mean_square_error double,
+    measurement_document_id int,
+
+    message_key text,
+    month_year text,
+
+    organization_id int,
+    organization_name text,
+    organization_no text,
+
+    parameter text,
+
+    plant_id int,
+    plant_name text,
+    plant_no text,
+
+    predicted_lower double,
+    predicted_upper double,
+    predicted_value double,
+
+    produced_stock_id int,
+    produced_stock_name text,
+    produced_stock_no text,
+
+    regression_value double,
+
+    sensor_values map<text, frozen<map<text, text>>>,
+
+    shift_finish_text text,
+    shift_finish_time timestamp,
+    shift_start_text text,
+    shift_start_time timestamp,
+
+    stock_id int,
+
+    trend double,
+    trend_calculation_active boolean,
+    trend_lower double,
+    trend_upper double,
+    
+    quantity_change double,
+
+    valuation_code text,
+    windowing_timestamp bigint,
+
+    work_center_id int,
+    work_center_name text,
+    work_center_no text,
+
+    work_station_id int,
+    work_station_name text,
+    work_station_no text,
+
+    workstation_state text,
+
+    year text,
+    year_month text,
+
+    PRIMARY KEY ((prod_order_reference_no), measurement_date)
+) WITH CLUSTERING ORDER BY (measurement_date DESC);
+
+
+CREATE INDEX ON tbl_p2_one_minute_anomaly (customer);
+CREATE INDEX ON tbl_p2_one_minute_anomaly (plant_id);
+CREATE INDEX ON tbl_p2_one_minute_anomaly (produced_stock_id);
+CREATE INDEX ON tbl_p2_one_minute_anomaly (equipment_id);
+CREATE INDEX ON tbl_p2_one_minute_anomaly (job_order_operation_id);
+CREATE INDEX ON tbl_p2_one_minute_anomaly (work_station_id);
+CREATE INDEX ON tbl_p2_one_minute_anomaly (work_center_id);
+CREATE INDEX ON tbl_p2_one_minute_anomaly (good);
+CREATE INDEX ON tbl_p2_one_minute_anomaly (quantity_changed);
+CREATE INDEX ON tbl_p2_one_minute_anomaly (algorithm);
+
+
+----------------------------------------------
+
+public enum MachineStateEnum {
+    Closed(0, "262626"),
+    StandBy(1, "#dbb880"),
+    Running(2, "#6ad510"),
+    Setup(3, "#20a8d8"),
+    Stopped(5, "#c93a29"),
+    Manipulation(6, "#c93a29"),
+    Malfunction(7, "#c93a29"),
+    Loading(8, "#c93a29");
+
+----------------------------------------------
+
+[message] produced: {
+'plId': 130, 
+'stId': 284079, 
+'wsId': 4410, 
+'eqId': 6901, 
+'cntRead': 18.94994, 
+'mcSt': 'Running', 
+'goodCnt': None, 
+'chngCycQty': 0.0, 
+'cust': 'teknia_group', 
+'measDocId': None, 
+'measDt': 1756864821355, 
+'valCd': None, 
+'param': None, 
+'act': False, 
+'crDt': 1756864821356, 
+'updDt': None, 
+'bias': None, 
+'coef': None, 
+'regVal': None, 
+'msErr': None, 
+'eqMeasPtId': 58, 
+'eqCodeGrpHdrId': 0, 
+'eqNm': 'P1_current_pressure ', 
+'eqNo': 'MM12270', 
+'year': '2025', 
+'monYr': '9-2025', 
+'unqCd': '4410-6901-1756864821356', 
+'trendCalcAct': True, 
+'anomDetAct': True, 
+'crAutoMaintOrdNot': None, 
+'maxErrCntHr': None, 
+'maxErrCntMin': None, 
+'maxErrCntShft': None, 
+'currCycQty': 82.0, 
+'measurement_date': 1756864821355, 
+'partition_date': '2025-09-03'}
+
+[main message] produced: {
+'plId': 130, 
+'plNm': '130', 
+'joRef': 'WO00135036', 
+'joOpId': 807394, 
+'opNo': 'Urea line assembly', 
+'opNm': '10 || Urea line assembly',
+'opTc': '10', 
+'ordNo': '10', 
+'empId': None, 
+'empNo': None, 
+'empFn': None, 
+'empLn': None, 
+'wsId': 4410, 
+'wsNo': '441000WS00001', 
+'wsNm': 'UREA 4 PLC', 
+'wcId': 882, 
+'wcNo': 'WC1', 
+'wcNm': 'WORKCENTER', 
+'mcSt': 'Running', 
+'prSt': 'CLOSED', 
+'joPrSt': 'CLOSED', 
+'currCycQty': 82.0, 
+'chngCycQty': 0.0, 
+'goodCnt': None, 
+'shId': 1009, 
+'shNm': 'Third Shift', 
+'shSt': 1756843200000, 
+'shFt': 1756872000000, 
+'orgId': None, 
+'orgNo': None, 
+'orgNm': None, 
+'crDt': 1756864821356, 
+'inVars': None, 
+'qCList': None, 
+'outVals': [{'measDocId': None, 'measDt': 1756864821355, 'cntRead': 18.94994, 'valCd': None, 'param': None, 'act': False, 'crDt': 1756864821356, 'updDt': None, 'bias': None, 'coef': None, 'regVal': None, 'msErr': None, 'eqId': 6901, 'eqMeasPtId': 58, 'eqCodeGrpHdrId': 0, 'eqNm': 'P1_current_pressure ', 'eqNo': 'MM12270', 'cust': 'teknia_group', 'year': '2025', 'monYr': '9-2025', 'unqCd': '4410-6901-1756864821356', 'trendCalcAct': True, 'anomDetAct': True, 'crAutoMaintOrdNot': None, 'maxErrCntHr': None, 'maxErrCntMin': None, 'maxErrCntShft': None, 'currCycQty': 82.0, 'chngCycQty': 0.0, 'goodCnt': None}, {'measDocId': None, 'measDt': 1756864821355, 'cntRead': 0.0, 'valCd': None, 'param': None, 'act': False, 'crDt': 1756864821356, 'updDt': None, 'bias': None, 'coef': None, 'regVal': None, 'msErr': None, 'eqId': 6902, 'eqMeasPtId': 59, 'eqCodeGrpHdrId': 0, 'eqNm': 'P1_current_flow ', 'eqNo': 'MM12271', 'cust': 'teknia_group', 'year': '2025', 'monYr': '9-2025', 'unqCd': '4410-6902-1756864821356', 'trendCalcAct': True, 'anomDetAct': True, 'crAutoMaintOrdNot': None, 'maxErrCntHr': None, 'maxErrCntMin': None, 'maxErrCntShft': None, 'currCycQty': 82.0, 'chngCycQty': 0.0, 'goodCnt': None}, {'measDocId': None, 'measDt': 1756864821355, 'cntRead': 0.435504, 'valCd': None, 'param': None, 'act': False, 'crDt': 1756864821356, 'updDt': None, 'bias': None, 'coef': None, 'regVal': None, 'msErr': None, 'eqId': 6903, 'eqMeasPtId': 60, 'eqCodeGrpHdrId': 0, 'eqNm': 'P1_current_resistance ', 'eqNo': 'MM12272', 'cust': 'teknia_group', 'year': '2025', 'monYr': '9-2025', 'unqCd': '4410-6903-1756864821356', 'trendCalcAct': None, 'anomDetAct': None, 'crAutoMaintOrdNot': None, 'maxErrCntHr': None, 'maxErrCntMin': None, 'maxErrCntShft': None, 'currCycQty': 82.0, 'chngCycQty': 0.0, 'goodCnt': None}, {'measDocId': None, 'measDt': 1756864821355, 'cntRead': 19.009462, 'valCd': None, 'param': None, 'act': False, 'crDt': 1756864821356, 'updDt': None, 'bias': None, 'coef': None, 'regVal': None, 'msErr': None, 'eqId': 6908, 'eqMeasPtId': 61, 'eqCodeGrpHdrId': 0, 'eqNm': 'P2_current_pressure  ', 'eqNo': 'MM12278', 'cust': 'teknia_group', 'year': '2025', 'monYr': '9-2025', 'unqCd': '4410-6908-1756864821356', 'trendCalcAct': True, 'anomDetAct': True, 'crAutoMaintOrdNot': None, 'maxErrCntHr': None, 'maxErrCntMin': None, 'maxErrCntShft': None, 'currCycQty': 82.0, 'chngCycQty': 0.0, 'goodCnt': None}, {'measDocId': None, 'measDt': 1756864821355, 'cntRead': 0.0, 'valCd': None, 'param': None, 'act': False, 'crDt': 1756864821356, 'updDt': None, 'bias': None, 'coef': None, 'regVal': None, 'msErr': None, 'eqId': 6909, 'eqMeasPtId': 62, 'eqCodeGrpHdrId': 0, 'eqNm': 'P2_current_flow  ', 'eqNo': 'MM12279', 'cust': 'teknia_group', 'year': '2025', 'monYr': '9-2025', 'unqCd': '4410-6909-1756864821356', 'trendCalcAct': True, 'anomDetAct': True, 'crAutoMaintOrdNot': None, 'maxErrCntHr': None, 'maxErrCntMin': None, 'maxErrCntShft': None, 'currCycQty': 82.0, 'chngCycQty': 0.0, 'goodCnt': None}, {'measDocId': None, 'measDt': 1756864821356, 'cntRead': 0.441502, 'valCd': None, 'param': None, 'act': False, 'crDt': 1756864821356, 'updDt': None, 'bias': None, 'coef': None, 'regVal': None, 'msErr': None, 'eqId': 6910, 'eqMeasPtId': 63, 'eqCodeGrpHdrId': 0, 'eqNm': 'P2_current_resistance ', 'eqNo': 'MM12280', 'cust': 'teknia_group', 'year': '2025', 'monYr': '9-2025', 'unqCd': '4410-6910-1756864821356', 'trendCalcAct': None, 'anomDetAct': None, 'crAutoMaintOrdNot': None, 'maxErrCntHr': None, 'maxErrCntMin': None, 'maxErrCntShft': None, 'currCycQty': 82.0, 'chngCycQty': 0.0, 'goodCnt': None}], 
+'compBats': [], 
+'prodList': [{'joStId': 3259641, 'stId': 284079, 'qty': 80.0, 'defQty': 2.0, 'rwQty': 0.0, 'stNm': '0736642800613', 'stNo': '0736642800613', 'batch': None, 'useSt': False, 'needQty': 47620.0, 'unit': 'PCS', 'cycRt': 0.0, 'cycProdRt': 1.0, 'ordUnit': None, 'ordQty': None}],
+'inputVariableList': []}
+
+
+
+@Repository
+public interface MultipleEquipmentAnomalyRepository extends CassandraRepository<ResponseMultipleEquipmentAnomalyDto, UUID> {
+ 
+    @Query(value = "select * from dw_tbl_multiple_anomalies where plant_id=:plantid and partition_date>=:dataStart and partition_date<=:dataFinish "
+            + " and customer=:customer  and ( measurement_date>=:rangestart)  and ( measurement_date<=:rangefinish)  ALLOW FILTERING", allowFiltering = true)
+    Slice<ResponseMultipleEquipmentAnomalyDto> findByPlantIdAndCustomer(
+            @Param("plantid") Integer plantid,
+            @Param("customer") String customer,
+            @Param("rangestart") Date rangeStart,
+            @Param("rangefinish") Date rangeFinish,
+            @Param("dataStart") String dataStart,
+            @Param("dataFinish") String dataFinish,
+            Pageable pageable);
+ 
+    @Query(value = "select * from dw_tbl_multiple_anomalies where plant_id=:plantid and partition_date>=:dataStart and partition_date<=:dataFinish "
+            + " and customer=:customer and workstation_no=:workstationno  and ( measurement_date>=:rangestart)  and ( measurement_date<=:rangefinish)  ALLOW FILTERING", allowFiltering = true)
+    Slice<ResponseMultipleEquipmentAnomalyDto> findByPlantIdAndCustomerByWorkStation(
+            @Param("plantid") Integer plantid,
+            @Param("customer") String customer,
+            @Param("workstationno") String workstationno,
+            @Param("rangestart") Date rangeStart,
+            @Param("rangefinish") Date rangeFinish,
+            @Param("dataStart") String dataStart,
+            @Param("dataFinish") String dataFinish,
+            Pageable pageable);
+ 
+    @Query(value = "select * from dw_tbl_multiple_anomalies where plant_id=:plantid and partition_date>=:dataStart and partition_date<=:dataFinish "
+            + " and customer=:customer and workcenter_no=:workcenterno  and ( create_date>=:rangestart)  and ( create_date<=:rangefinish)  ALLOW FILTERING", allowFiltering = true)
+    Slice<ResponseMultipleEquipmentAnomalyDto> findByPlantIdAndCustomerByWorkCenter(
+            @Param("plantid") Integer plantid,
+            @Param("customer") String customer,
+            @Param("workcenterno") String workcenterno,
+            @Param("rangestart") Date rangeStart,
+            @Param("rangefinish") Date rangeFinish,
+            @Param("dataStart") String dataStart,
+            @Param("dataFinish") String dataFinish,
+            Pageable pageable);
+ 
+    @Query(value = "select * from dw_tbl_multiple_anomalies where plant_id=:plantid and partition_date>=:dataStart and partition_date<=:dataFinish "
+            + " and customer=:customer and workstation_no=:workstationno and produced_stock_id=:producedStockId "
+            + " and ( measurement_date>=:rangestart)  and ( measurement_date<=:rangefinish)  ALLOW FILTERING", allowFiltering = true)
+    Slice<ResponseMultipleEquipmentAnomalyDto> findByPlantIdAndCustomerAndWorkStationAndStock(
+            @Param("plantid") Integer plantid,
+            @Param("customer") String customer,
+            @Param("workstationno") String workstationno,
+            @Param("rangestart") Date rangeStart,
+            @Param("rangefinish") Date rangeFinish,
+            @Param("dataStart") String dataStart,
+            @Param("dataFinish") String dataFinish,
+            @Param("producedStockId") Integer producedStockId,
+            Pageable pageable);
+ 
+    @Query(value = "select * from dw_tbl_multiple_anomalies where plant_id=:plantid and partition_date>=:dataStart and partition_date<=:dataFinish "
+            + " and customer=:customer and produced_stock_id=:producedStockId "
+            + " and ( measurement_date>=:rangestart)  and ( measurement_date<=:rangefinish)  ALLOW FILTERING", allowFiltering = true)
+    Slice<ResponseMultipleEquipmentAnomalyDto> findByPlantIdAndCustomerAndStock(
+            @Param("plantid") Integer plantid,
+            @Param("customer") String customer,
+            @Param("rangestart") Date rangeStart,
+            @Param("rangefinish") Date rangeFinish,
+            @Param("dataStart") String dataStart,
+            @Param("dataFinish") String dataFinish,
+            @Param("producedStockId") Integer producedStockId,
+            Pageable pageable);
+} dw_tbl_multiple_anomalies tablosundan çekilen queryler bunlar.
+
+
+
+eski multi
+
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_algorithm_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_customer_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_good_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_job_order_operation_id_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_plant_id_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_produced_stock_id_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_production_order_ref_id_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_quantity_changed_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_workcenter_id_idx;
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_multiple_anomalies_workstation_id_idx;
+
+DROP TABLE IF EXISTS dw_tbl_multiple_anomalies;
+
+CREATE TABLE dw_tbl_multiple_anomalies (
+    active boolean,
+    anomaly_importance double,
+    anomaly_score double,
+    anomaly_detected boolean,
+    customer text,
+    employee_id int,
+    id uuid,
+    job_order_operation_id int,
+    job_order_operation_ref_id text,
+    machine_state text,
+    measurement_date timestamp,
+    message_key text,
+    plant_id int,
+    plant_name text,
+    plant_no text,
+    produced_stock_id int,
+    produced_stock_name text,
+    produced_stock_no text,
+    sensor_values map<text, frozen<map<text, text>>>,
+    input_variables map<text, frozen<map<text, text>>>,
+    shift_finish_text text,
+    shift_finish_time timestamp,
+    shift_start_text text,
+    shift_start_time timestamp,
+    workcenter_id int,
+    workcenter_name text,
+    workcenter_no text,
+    workstation_id int,
+    workstation_name text,
+    workstation_no text,
+    workstation_state text,
+    unique_code text,
+    heatmap map<text, frozen<map<text, text>>>,
+    heapmap_threshold double,
+    good boolean,
+    quantity_changed boolean,
+    current_quantity double,
+    algorithm text,
+    production_order_ref_id text,
+    partition_date text,
+    PRIMARY KEY ((partition_date), measurement_date, unique_code)
+) WITH CLUSTERING ORDER BY (measurement_date DESC, unique_code ASC);
+ 
+CREATE INDEX ON dw_tbl_multiple_anomalies (customer);
+CREATE INDEX ON dw_tbl_multiple_anomalies (plant_id);
+CREATE INDEX ON dw_tbl_multiple_anomalies (produced_stock_id);
+CREATE INDEX ON dw_tbl_multiple_anomalies (equipment_id);
+CREATE INDEX ON dw_tbl_multiple_anomalies (job_order_operation_id);
+CREATE INDEX ON dw_tbl_multiple_anomalies (workstation_id);
+CREATE INDEX ON dw_tbl_multiple_anomalies (workcenter_id);
+CREATE INDEX ON dw_tbl_multiple_anomalies (good);
+CREATE INDEX ON dw_tbl_multiple_anomalies (quantity_changed);
+CREATE INDEX ON dw_tbl_multiple_anomalies (algorithm);
+CREATE INDEX ON dw_tbl_multiple_anomalies (production_order_ref_id);
+
+
+
+----------------------------------------------
+old dw_tbl_raw_data with null columns
+
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_raw_data_job_order_operation_id_idx;
+
+DROP INDEX IF EXISTS das_new_pm.index_dw_create_date;
+
+DROP INDEX IF EXISTS das_new_pm.index_dw_customer;
+
+DROP INDEX IF EXISTS das_new_pm.index_dw_organization_id;
+
+DROP INDEX IF EXISTS das_new_pm.index_dw_plant_id;
+
+DROP INDEX IF EXISTS das_new_pm.index_dw_workcenter_name;
+
+DROP INDEX IF EXISTS das_new_pm.index_dw_workcenter_no;
+
+DROP INDEX IF EXISTS das_new_pm.index_machine_state;
+
+DROP INDEX IF EXISTS das_new_pm.index_work_station_id;
+
+DROP INDEX IF EXISTS das_new_pm.index_workstation_name;
+
+DROP INDEX IF EXISTS das_new_pm.index_workstation_no;
+
+DROP INDEX IF EXISTS das_new_pm.produced_stock_id_idx;
+
+DROP INDEX IF EXISTS das_new_pm.job_order_reference_no_idx;
+
+DROP INDEX IF EXISTS das_new_pm.prod_order_reference_no_idx;
+
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_raw_data_job_order_operation_id_idx;
+
+DROP INDEX IF EXISTS das_new_pm.dw_tbl_raw_data_operationTaskCode_idx;
+
+DROP TABLE IF EXISTS das_new_pm.dw_tbl_raw_data;
+
+CREATE TABLE das_new_pm.dw_tbl_raw_data (
+    active boolean,
+    anomaly_detection_active boolean,
+    good boolean,
+    bias double,
+    coefficient double,
+    counter_reading double,
+    gen_read_val double,
+    create_auto_maintenance_order_notification boolean,
+    create_date timestamp,
+    customer text,
+    employee_id int,
+    equipment_code_group_header_id int,
+    equipment_id int,
+    equipment_measuring_point_id int,
+    equipment_name text,
+    equipment_no text,
+    equipment_type boolean,
+    job_order_operation_id int,
+    job_order_reference_no text,
+    prod_order_reference_no text,
+    machine_state text,
+    max_error_count_in_hour int,
+    max_error_count_in_min int,
+    max_error_count_in_shift int,
+    mean_square_error double,
+    measurement_date timestamp,
+    measurement_document_id int,
+    month_year text,
+    operationName text,
+    operationNo text,
+    operationTaskCode text,
+    organization_id int,
+    organization_name text,
+    organization_no text,
+    parameter text,
+    plant_id int,
+    plant_name text,
+    produced_stock_id int,
+    produced_stock_name text,
+    produced_stock_no text,
+    regression_value double,
+    shift_finish_time timestamp,
+    shift_start_time timestamp,
+    stock_id int,
+    trend_calculation_active boolean,
+    unique_code text,
+    update_date timestamp,
+    valuation_code text,
+    work_center_id int,
+    work_center_name text,
+    work_center_no text,
+    work_station_id int,
+    work_station_name text,
+    work_station_no text,
+    workstation_state text,
+    year text,
+    PRIMARY KEY (unique_code)
+);
+
+
+CREATE INDEX dw_tbl_raw_data_job_order_operation_id_idx
+ON das_new_pm.dw_tbl_raw_data (job_order_operation_id);
+
+CREATE INDEX index_dw_create_date
+ON das_new_pm.dw_tbl_raw_data (create_date);
+
+CREATE INDEX index_dw_customer
+ON das_new_pm.dw_tbl_raw_data (customer);
+
+CREATE INDEX index_dw_organization_id
+ON das_new_pm.dw_tbl_raw_data (organization_id);
+
+CREATE INDEX index_dw_plant_id
+ON das_new_pm.dw_tbl_raw_data (plant_id);
+
+CREATE INDEX index_dw_workcenter_name
+ON das_new_pm.dw_tbl_raw_data (work_center_name);
+
+CREATE INDEX index_dw_workcenter_no
+ON das_new_pm.dw_tbl_raw_data (work_center_no);
+
+CREATE INDEX index_machine_state
+ON das_new_pm.dw_tbl_raw_data (machine_state);
+
+CREATE INDEX index_work_station_id
+ON das_new_pm.dw_tbl_raw_data (work_station_id);
+
+CREATE INDEX index_workstation_name
+ON das_new_pm.dw_tbl_raw_data (work_station_name);
+
+CREATE INDEX index_workstation_no
+ON das_new_pm.dw_tbl_raw_data (work_station_no);
+
+CREATE INDEX produced_stock_id_idx
+ON das_new_pm.dw_tbl_raw_data (produced_stock_id);
+
+CREATE INDEX job_order_reference_no_idx
+ON das_new_pm.dw_tbl_raw_data (job_order_reference_no);
+
+CREATE INDEX prod_order_reference_no_idx
+ON das_new_pm.dw_tbl_raw_data (prod_order_reference_no);
+
+CREATE INDEX operationTaskCode_idx
+ON das_new_pm.dw_tbl_raw_data (operationTaskCode);
+
+----------------------------------------------

@@ -1,0 +1,40 @@
+[Unit]
+Description=PM-Phase3
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/Maintenance_Module/feyza-pm/pm-phase3
+ExecStart=/bin/bash -lc 'source /opt/Maintenance_Module/feyza-pm/msf-predictive-maintenance/venv/bin/activate && exec python /opt/Maintenance_Module/feyza-pm/pm-phase3/main.py'
+
+# Restart policy
+Restart=always
+RestartSec=5
+Environment="PYTHONUNBUFFERED=3"
+
+# ---------- RESOURCE LIMITS ----------
+# CPU limit: 50% of one CPU core
+CPUQuota=50%
+
+# Memory limit: 2 GB total for this service
+MemoryMax=2G
+
+# Swap limit (optional): allow a little swap if needed
+MemorySwapMax=3G
+
+# I/O throttling (optional, adjust as needed)
+# BlockIOWeight=100           # (1–1000; higher = higher priority)
+# IOReadBandwidthMax=/dev/sda 5M
+# IOWriteBandwidthMax=/dev/sda 5M
+
+# Prevent runaway processes
+TasksMax=100
+LimitNOFILE=4096
+
+# Optional logging redirection
+# StandardOutput=append:/opt/Maintenance_Module/feyza-pm/pm-phase3/logs/app.out.log
+# StandardError=append:/opt/Maintenance_Module/feyza-pm/pm-phase3/logs/app.err.log
+
+[Install]
+WantedBy=multi-user.target
