@@ -9,7 +9,7 @@ import joblib
 from sklearn.preprocessing import MinMaxScaler
 
 import tensorflow as tf
-from tensorflow.keras import layers, models
+from tensorflow.keras import layers, models # type: ignore
 
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.ensemble import RandomForestRegressor
@@ -138,12 +138,25 @@ class SeriesBuffer:
         self.first_ts = None
 
     def append_row(self, ts: datetime, values: Dict[str, float]):
-        idx = len(self.df)
-        self.df = pd.concat([self.df, pd.DataFrame([values], index=[idx])], axis=0)
+        """Append one observation keyed by timestamp.
+
+        We keep a datetime index so we can resample (30s / 1min) later.
+        If multiple points arrive for the same timestamp we keep the last one.
+        """
+        if ts is None:
+            ts = datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        self.df = pd.concat([self.df, pd.DataFrame([values], index=[ts])], axis=0)
+        # If same timestamp appears multiple times, keep the last message.
+        self.df = self.df[~self.df.index.duplicated(keep="last")]
+        self.df = self.df.sort_index()
         if len(self.df) > self.maxlen:
             self.df = self.df.tail(self.maxlen)
         if self.first_ts is None:
             self.first_ts = ts
+
 
 _buffers: Dict[str, SeriesBuffer] = defaultdict(lambda: SeriesBuffer(maxlen=5000))
 
@@ -418,8 +431,13 @@ def extract_prediction_metadata(message: dict) -> Dict[str, str]:
                               if isinstance(message.get("prodList"), list) and message.get("prodList") else message.get("stNm")),
         "output_stock_no":   (message.get("prodList",[{}])[0].get("stNo") 
                               if isinstance(message.get("prodList"), list) and message.get("prodList") else message.get("stNo")),
-        "job_order_reference_no": str(message.get("joRef") or message.get("job_order_reference_no") or ""),
-        "prod_order_reference_no": str(message.get("refNo") or message.get("prod_order_reference_no") or ""),
+        
+        # "job_order_reference_no": str(message.get("joRef") or message.get("job_order_reference_no") or ""),
+        # "prod_order_reference_no": str(message.get("refNo") or message.get("prod_order_reference_no") or ""),
+
+        "job_order_reference_no": str(message.get("job_order_reference_no") or message.get("refNo") or message.get("joRef") or ""),
+        "prod_order_reference_no": str(message.get("prod_order_reference_no") or message.get("joRef") or message.get("refNo") or ""),
+
         "operationname":     message.get("operationname") or message.get("opNm") or "",
         "operationno":       message.get("operationno") or message.get("opNo") or "",
         "operationtaskcode": message.get("operationtaskcode") or message.get("opTc") or "",
@@ -858,12 +876,38 @@ def _rt_seed_and_append_buffer(key, cols, seed_history, flat_vals, message, p3_1
 
     return key_buf.df.copy()
 
-def _rt_prepare_df(df_raw, p3_1_log=None, key=None):
-    df = df_raw.apply(pd.to_numeric, errors="coerce") \
-               .fillna(method="ffill") \
-               .fillna(method="bfill") \
-               .fillna(0.0)
+#UPDATECODE
+def _rt_prepare_df(df_raw, p3_1_log=None, key=None, resample_seconds: int = None):
+    """Prepare buffer DF for modeling.
+
+    - ensures numeric
+    - optional resampling to a fixed cadence
+    - forward/back fill then 0.0 for remaining gaps
+    """
+    df = df_raw.copy()
+
+    # Ensure datetime index for resampling
+    if not isinstance(df.index, pd.DatetimeIndex):
+        try:
+            df.index = pd.to_datetime(df.index, utc=True)
+        except Exception:
+            pass
+
+    if resample_seconds and isinstance(df.index, pd.DatetimeIndex):
+        try:
+            # Use LAST value in the bin. For SCADA/counter readings, "last" preserves
+            # step changes better than mean.
+            df = df.sort_index().resample(f"{int(resample_seconds)}S").last()
+        except Exception as e:
+            if p3_1_log:
+                p3_1_log.warning(f"[rt_pred] resample failed for key={key}: {e}")
+
+    df = df.apply(pd.to_numeric, errors="coerce") \
+           .ffill() \
+           .bfill() \
+           .fillna(0.0)
     return df
+
 
 def _rt_quality_check(cols, df, scaler_path, last_pred_vec, bad_streak, p3_1_log):
     retrain_due_to_quality = False
@@ -941,7 +985,8 @@ def _predict_single_type(
     min_train_points: int,
     algorithm: str,
     seed_history,
-    p3_1_log
+    p3_1_log,
+    resample_seconds: int = None,
 ) -> Tuple[dict, bool]:
     """
     Run prediction for a single model type (INPUT or OUTPUT).
@@ -979,7 +1024,7 @@ def _predict_single_type(
     
     # Seed and append buffer
     df_raw = _rt_seed_and_append_buffer(key, cols, seed_history, var_dict, message, p3_1_log)
-    df = _rt_prepare_df(df_raw, p3_1_log=p3_1_log, key=key)
+    df = _rt_prepare_df(df_raw, p3_1_log=p3_1_log, key=key, resample_seconds=resample_seconds)
     df_for_mean = df_raw
     
     # Check if enough data
@@ -1120,6 +1165,7 @@ def _predict_single_type(
 # MAIN FUNCTION - Orchestrates both INPUT and OUTPUT models
 # ============================================================
 
+#UPDATECODE   
 def handle_realtime_prediction(message: dict,
                                p3_1_log=None,
                                lookback: int = LOOKBACK,
@@ -1130,8 +1176,10 @@ def handle_realtime_prediction(message: dict,
                                scope: str = "pid",
                                scope_id=None,
                                group_by_stock: bool = False,
-                               retrain: bool = False) -> dict:
-    
+                               retrain: bool = False,
+                               resample_seconds: int = None,
+                               dry_run: bool = False) -> dict:
+
     log = (p3_1_log.debug if p3_1_log else print)
     warn = (p3_1_log.warning if p3_1_log else print)
     info = (p3_1_log.info if p3_1_log else print)
@@ -1235,6 +1283,20 @@ def handle_realtime_prediction(message: dict,
                 p3_1_log=p3_1_log
             )
         
+        elif scope == "batch":
+            # Batch-scoped prediction: store like PID-level (partitioned by prod_order_reference_no)
+            ref_key = _realtime_model_key_with_type(scope, scope_id, message, group_by_stock, "OUTPUT")
+
+            ScadaRealTimePredictions.saveData(
+                key=ref_key,
+                now_ts=now_ts,
+                algorithm=algo_name,
+                input_payload=input_payload,
+                output_payload=output_payload,
+                meta=meta,
+                p3_1_log=p3_1_log
+            )
+
         status.update({
             "ok": True,
             "wrote": True,

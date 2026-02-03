@@ -1,4 +1,7 @@
 {
+    "resample_seconds": 60,
+    "prediction_scope_mode": "batch",
+    
     "thread_num": 3,
     "message_processor_thread": 1,
     "consumer_preprocess_thread_2": 1,
@@ -16,7 +19,7 @@
         "security.protocol": "SASL_PLAINTEXT",
         "sasl.username": "MSF_Kafka",
         "sasl.password": "KMSFclient%&..",
-        "group.id": "meric-ph3",
+        "group.id": "meric-ph4",
         "auto.offset.reset": "earliest",
         "queued.max.messages.kbytes": 262144,      
         "fetch.max.bytes": 52428800,

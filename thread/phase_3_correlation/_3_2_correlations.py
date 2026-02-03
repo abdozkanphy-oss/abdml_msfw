@@ -81,21 +81,34 @@ PID_TIME_THRESHOLD  = TIME_THRESHOLD      # seconds
 WS_COUNT_THRESHOLD  = COUNT_THRESHOLD     # or maybe bigger, e.g. 50
 WS_TIME_THRESHOLD   = TIME_THRESHOLD      # seconds
 
-def _should_fire(buffer_entry, min_points, max_interval_sec, now_epoch=None):
-    """
-    Decide whether a buffer has enough points or time to trigger processing.
+# ----------------- ABDML cadence -----------------
+# We start with 1-minute resampling (stable baseline). You can later try 30s by
+# adding "resample_seconds": 30 in utils/config.json.
+RESAMPLE_SECONDS = int(getattr(cfg, "resample_seconds", 60) or 60)
 
-    Returns: (fire_bool, count, time_lapsed)
-    """
+# Prediction scope mode:
+# - "pid": current behavior (operation/joOpId focused)
+# - "batch": key prediction models by full batch id (prod_order_reference_no)
+PREDICTION_SCOPE_MODE = str(getattr(cfg, "prediction_scope_mode", "batch") or "batch").strip().lower()
+
+
+#FIXCODE
+def _should_fire(buffer_entry, min_points, max_interval_sec, now_epoch=None):
     if now_epoch is None:
         now_epoch = time.time()
 
-    cnt = buffer_entry.get("count", 0)
-    first_seen = buffer_entry.get("first_seen", now_epoch)
-    time_lapsed = now_epoch - first_seen
+    cnt = int(buffer_entry.get("count", 0) or 0)
+    first_seen = buffer_entry.get("first_seen")
 
-    fire = (cnt >= 2) or (time_lapsed >= max_interval_sec)
-    return True, cnt, time_lapsed #fire, cnt, time_lapsed
+    if first_seen is None:
+        first_seen = now_epoch
+        buffer_entry["first_seen"] = first_seen
+
+    time_lapsed = float(now_epoch) - float(first_seen)
+
+    fire = (cnt >= int(min_points)) or (time_lapsed >= float(max_interval_sec))
+    return fire, cnt, time_lapsed
+
 
 p3_1_log = setup_logger(
     "p3_1_logger", "logs/p3_1.log"
@@ -1630,19 +1643,32 @@ def execute_phase_three():
                     p3_1_log.info("[execute_phase_three] Skipping invalid message")
                     continue
 
-                # Map joRef from Kafka message into raw table column name
-                if "joRef" in message:
-                    message["job_order_reference_no"] = message["joRef"]
+                if message.get("plId") and message["plId"] != 76:
+                    p3_1_log.info("[execute_phase_three] Skipping Savola customer")
+                    continue
 
-                if "refNo" in message:
+                # if "joRef" in message and message.get("joRef") not in (None, "", "None"):
+                #     message["prod_order_reference_no"] = message["joRef"]
+                #     message.setdefault("job_order_reference_no", message["joRef"])
+
+                # if "refNo" in message and message.get("refNo") not in (None, "", "None", 0, "0"):
+                #     message["job_order_reference_no"] = message["refNo"]
+
+                # If refNo is empty/0, promote joRef into refNo so legacy logic continues unchanged.
+                if message.get("joRef") not in (None, "", "None") and message.get("refNo") in (None, "", "None", 0, "0"):
+                    message["refNo"] = message["joRef"]
+
+                # Canonical batch key (your definition)
+                if message.get("refNo") not in (None, "", "None", 0, "0"):
                     message["prod_order_reference_no"] = message["refNo"]
+                    message.setdefault("job_order_reference_no", message["refNo"])
 
-                # NEW: make sure missing refs become 0, without KeyError
+                # If we still have no batch reference, normalize to 0 to avoid KeyErrors downstream.
                 if not message.get("prod_order_reference_no"):
-                    message["job_order_reference_no"] = 0
+                    message["job_order_reference_no"] = message.get("job_order_reference_no") or 0
                     message["prod_order_reference_no"] = 0
-                    message["joRef"] = 0
-                    message["refNo"] = 0
+                    message["joRef"] = message.get("joRef") or 0
+                    message["refNo"] = message.get("refNo") or 0
 
                 # NEW: extract stock from prodList and put on message
                 st_no, st_nm = _extract_stock_from_prodlist_message(
@@ -2032,7 +2058,33 @@ def _run_3_tasks_and_wait(
 
     # ---- task 2: realtime prediction ----
     def _task_prediction():
-        if scope == "pid":
+
+        if PREDICTION_SCOPE_MODE == "batch":
+            batch_id = (
+                message.get("prod_order_reference_no")
+                or message.get("joRef")
+                or message.get("refNo")
+                or "0"
+            )
+            # Use the buffered history (already corresponds to the current scope window)
+            _, hist_out = history_from_fetch(dates, sensor_values)
+            seed = hist_out
+
+            res = handle_realtime_prediction(
+                message=message,
+                lookback=pred_lookback,
+                epochs=pred_epochs,
+                min_train_points=pred_min_train_points,
+                p3_1_log=p3_1_log,
+                algorithm=pred_algorithm,
+                seed_history=seed,
+                scope="batch",
+                scope_id=str(batch_id),
+                group_by_stock=True,
+                resample_seconds=RESAMPLE_SECONDS,
+            )
+
+        elif scope == "pid":
             op_tc = message.get("operationtaskcode") or message.get("opTc")
             stock_no = message.get("output_stock_no") or (
                 (message.get("prodList") or [{}])[0].get("stNo")
