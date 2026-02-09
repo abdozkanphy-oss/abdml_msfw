@@ -1,242 +1,309 @@
 import os
-import sys
-import pandas as pd
-import numpy as np
-import joblib
 import json
+import argparse
 import logging
-import matplotlib.pyplot as plt
-from datetime import datetime, timezone
+from datetime import datetime
 
-# ML Models
+import numpy as np
+import pandas as pd
+import joblib
+
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.multioutput import MultiOutputRegressor
-from xgboost import XGBRegressor
-from sklearn.metrics import r2_score
 from sklearn.preprocessing import RobustScaler
 
-# Setup Logging
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format='[PRODUCT_TRAIN] %(message)s')
-logger = logging.getLogger()
+logger = logging.getLogger("product_train")
 
-# =============================================================================
-# 1. IMPORT CORE PREPROCESSING
-# =============================================================================
-try:
-    from thread.phase_3_correlation._3_3_predictions import (
-        _rt_prepare_df, 
-        _make_sequences,
-        _save_model_any,
-        _save_meta,
-        _model_paths,
-        MODELS_DIR,
-        _norm_str
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _safe_name(x: str) -> str:
+    x = str(x or "").strip()
+    x = x.replace(" ", "_").replace("-", "_").replace("/", "_")
+    return "".join(ch for ch in x if ch.isalnum() or ch == "_")
+
+
+def _ensure_datetime_utc(s: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(s, errors="coerce", utc=True)
+    return dt
+
+
+def build_wide_batch_frame(
+    df_long: pd.DataFrame,
+    resample_seconds: int = 60,
+    resample_method: str = "last",
+    inactive_strategy: str = "FFILL",
+) -> pd.DataFrame:
+    """
+    df_long must contain: ts, equipment_name, counter_reading
+    Returns wide DF indexed by ts with one col per equipment_name.
+    """
+    if df_long.empty:
+        return pd.DataFrame()
+
+    wide = df_long.pivot_table(
+        index="ts",
+        columns="equipment_name",
+        values="counter_reading",
+        aggfunc="mean",
     )
-except ImportError:
-    logger.error("Could not import _3_3_predictions. Check project root.")
-    sys.exit(1)
 
-# =============================================================================
-# 2. CONFIGURATION & TOGGLES
-# =============================================================================
-CONFIG = {
-    # TOGGLE 1: Add "Time Since Batch Start" as a feature?
-    "USE_TIME_ELAPSED": True, 
+    wide = wide.sort_index()
+    wide = wide[~wide.index.duplicated(keep="last")]
 
-    # TOGGLE 2: How to handle empty data (e.g., Mixer off while Dryer runs)?
-    "INACTIVE_STRATEGY": "FFILL", # "ZERO" or "FFILL"
-    
-    # Model Params
-    "LOOKBACK": 20,
-    "ALGORITHM": "RANDOM_FOREST" 
-}
+    # Resample
+    rule = f"{int(resample_seconds)}S"
+    if resample_method.lower() == "mean":
+        wide = wide.resample(rule).mean()
+    else:
+        # default: last
+        wide = wide.resample(rule).last()
 
-# =============================================================================
-# 3. DATA PARSING (STRATEGY 2: WIDE DRUG MATRIX)
-# =============================================================================
-def parse_and_merge_by_drug(csv_path, target_drug_name=None):
-    if not os.path.exists(csv_path): return {}
+    # Fill strategy
+    if inactive_strategy.upper() == "ZERO":
+        wide = wide.fillna(0.0)
+    else:
+        # default: forward-fill then remaining to 0
+        wide = wide.ffill().fillna(0.0)
 
-    logger.info(f"Loading CSV: {csv_path}...")
+    # Ensure numeric
+    wide = wide.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    return wide
+
+
+def make_windows(
+    wide: pd.DataFrame,
+    lookback: int,
+    use_time_elapsed: bool,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """
+    Build (X,y) for next-step multivariate forecasting.
+
+    X shape: (N, lookback, F)
+    y shape: (N, F)
+    """
+    if wide is None or wide.empty:
+        return np.empty((0, lookback, 0)), np.empty((0, 0)), []
+
+    df = wide.copy()
+    cols = list(df.columns)
+
+    # Optional time feature
+    if use_time_elapsed:
+        t0 = df.index.min()
+        df["meta_time_elapsed_sec"] = (df.index - t0).total_seconds().astype(float)
+        cols = cols + ["meta_time_elapsed_sec"]
+
+    arr = df[cols].to_numpy(dtype=float)
+
+    if len(arr) <= lookback:
+        return np.empty((0, lookback, len(cols))), np.empty((0, len(cols))), cols
+
+    X_list, y_list = [], []
+    for i in range(lookback, len(arr)):
+        X_list.append(arr[i - lookback : i])
+        y_list.append(arr[i])
+
+    X = np.asarray(X_list, dtype=float)
+    y = np.asarray(y_list, dtype=float)
+    return X, y, cols
+
+
+def train_rf_multioutput(X: np.ndarray, y: np.ndarray, n_estimators: int = 300, random_state: int = 42):
+    """
+    Train MultiOutputRegressor(RandomForestRegressor) on flattened windows.
+    """
+    # Flatten (N, T, F) -> (N, T*F)
+    X_flat = X.reshape(X.shape[0], -1)
+
+    base = RandomForestRegressor(
+        n_estimators=int(n_estimators),
+        random_state=int(random_state),
+        n_jobs=-1,
+    )
+    model = MultiOutputRegressor(base)
+    model.fit(X_flat, y)
+    return model
+
+
+# -----------------------------------------------------------------------------
+# Main training pipeline
+# -----------------------------------------------------------------------------
+def train_all_drugs(
+    csv_path: str,
+    out_dir: str,
+    lookback: int = 20,
+    resample_seconds: int = 60,
+    resample_method: str = "last",
+    inactive_strategy: str = "FFILL",
+    use_time_elapsed: bool = True,
+    min_points_per_drug: int = 300,
+):
+    os.makedirs(out_dir, exist_ok=True)
+
+    logger.info(f"Loading CSV: {csv_path}")
     df = pd.read_csv(csv_path)
-    df['ts'] = pd.to_datetime(df['create_date'])
-    df = df.sort_values('ts')
-    
-    # Value Extraction
-    df['is_input'] = df['equipment_type'].apply(lambda x: str(x).lower() in ['true', '1', 't', 'yes'])
-    def get_val(row):
-        return row['gen_read_val'] if (row['is_input'] and pd.notna(row.get('gen_read_val'))) else row.get('counter_reading')
-    df['value'] = pd.to_numeric(df.apply(get_val, axis=1), errors='coerce')
-    df = df.dropna(subset=['value'])
-    
-    # Group by Stock No (Drug ID)
-    grouped_drugs = {}
-    group_cols = ['produced_stock_no', 'produced_stock_name']
-    
-    for (st_no, st_name), drug_group in df.groupby(group_cols):
-        
-        if target_drug_name and target_drug_name.lower() not in str(st_name).lower():
-            continue
-            
-        drug_key = f"DRUG_{_norm_str(st_name)}"
-        logger.info(f"--- Building Matrix for: {st_name} ({st_no}) ---")
-        
-        batch_dfs = []
-        for batch_id, batch_data in drug_group.groupby('prod_order_reference_no'):
-            
-            # 1. Pivot Batch
-            wide_batch = batch_data.pivot_table(
-                index='ts', columns='equipment_name', values='value', aggfunc='mean'
-            )
-            
-            # 2. Resample
-            wide_batch = wide_batch.resample('1min').mean()
-            
-            # 3. Handle Inactive
-            if CONFIG["INACTIVE_STRATEGY"] == "ZERO":
-                wide_batch = wide_batch.fillna(0.0)
-            elif CONFIG["INACTIVE_STRATEGY"] == "FFILL":
-                wide_batch = wide_batch.ffill().fillna(0.0)
-            
-            # 4. Add Time Elapsed
-            if CONFIG["USE_TIME_ELAPSED"] and len(wide_batch) > 0:
-                start_time = wide_batch.index[0]
-                time_deltas = (wide_batch.index - start_time).total_seconds() / 60.0
-                wide_batch['meta_time_elapsed'] = time_deltas
-            
-            if len(wide_batch) > CONFIG["LOOKBACK"]:
-                batch_dfs.append(wide_batch)
 
-        grouped_drugs[drug_key] = batch_dfs
-        
-    return grouped_drugs
+    required = [
+        "prod_order_reference_no",
+        "produced_stock_name",
+        "equipment_name",
+        "counter_reading",
+        "create_date",
+    ]
+    for c in required:
+        if c not in df.columns:
+            raise ValueError(f"Missing required column: {c}")
 
-# =============================================================================
-# 4. TRAINING & EVALUATION
-# =============================================================================
-def train_product_model(target_drug="Antares"):
-    
-    # 1. Parse Data
-    drug_matrices = parse_and_merge_by_drug("dw_tbl_raw_data_MARIFARM.csv", target_drug)
-    
-    if not drug_matrices:
-        logger.warning("No data found for target drug.")
-        return
+    df["ts"] = _ensure_datetime_utc(df["create_date"])
+    df = df.dropna(subset=["ts"])
+    df = df.sort_values("ts")
 
-    for key, batches in drug_matrices.items():
-        logger.info(f"Training Model for {key} | Batches: {len(batches)}")
-        
-        if len(batches) < 2:
-            logger.warning("Not enough batches to split.")
+    # Ensure strings
+    df["prod_order_reference_no"] = df["prod_order_reference_no"].astype(str)
+    df["produced_stock_name"] = df["produced_stock_name"].astype(str)
+    df["equipment_name"] = df["equipment_name"].astype(str)
+
+    drugs = sorted(df["produced_stock_name"].dropna().unique().tolist())
+    logger.info(f"Found {len(drugs)} drugs: {drugs}")
+
+    for drug in drugs:
+        df_d = df[df["produced_stock_name"] == drug].copy()
+        if df_d.empty:
             continue
 
-        # --- A. Align Columns ---
-        all_cols = set()
-        for b in batches: all_cols.update(b.columns)
-        all_cols = sorted(list(all_cols))
-        
-        aligned_batches = []
+        # Build batch-wise wide frames and concatenate
+        batches = sorted(df_d["prod_order_reference_no"].unique().tolist())
+        all_X, all_y = [], []
+        cols_ref = None
+
+        logger.info(f"Training drug='{drug}' batches={len(batches)}")
+
         for b in batches:
-            b_aligned = b.reindex(columns=all_cols, fill_value=0).sort_index()
-            aligned_batches.append(b_aligned)
-            
-        # --- B. Split & Scale ---
-        split_idx = int(len(aligned_batches) * 0.8)
-        train_dfs = aligned_batches[:split_idx]
-        val_dfs = aligned_batches[split_idx:]
-        
-        scaler = RobustScaler(quantile_range=(5.0, 95.0))
-        full_train = pd.concat(train_dfs)
-        scaler.fit(full_train.values)
-        
-        # --- C. Sequence Generation ---
-        def get_seqs(dfs):
-            X, y = [], []
-            for df in dfs:
-                vals = scaler.transform(df.values)
-                vals = np.clip(vals, -10.0, 10.0)
-                xs, ys = _make_sequences(vals, CONFIG["LOOKBACK"])
-                if len(xs) > 0:
-                    X.append(xs)
-                    y.append(ys)
-            if not X: return None, None
-            return np.vstack(X), np.vstack(y)
+            df_b = df_d[df_d["prod_order_reference_no"] == b].copy()
+            df_b = df_b[["ts", "equipment_name", "counter_reading"]]
 
-        X_train, y_train = get_seqs(train_dfs)
-        X_val, y_val = get_seqs(val_dfs)
-        
-        if X_train is None: continue
+            wide = build_wide_batch_frame(
+                df_b,
+                resample_seconds=resample_seconds,
+                resample_method=resample_method,
+                inactive_strategy=inactive_strategy,
+            )
+            if wide.empty:
+                continue
 
-        # --- D. Train ---
-        logger.info(f"   Input Shape: {X_train.shape} (Samples, Time, Sensors)")
-        
-        # Flatten for Tree Models
-        X_train_flat = X_train.reshape(X_train.shape[0], -1)
-        
-        model = MultiOutputRegressor(RandomForestRegressor(
-            n_estimators=100, 
-            max_depth=15, 
-            n_jobs=-1,
-            random_state=42
-        ), n_jobs=-1)
-        
-        model.fit(X_train_flat, y_train)
-        
-        # --- E. Evaluate ALL SENSORS ---
-        if X_val is not None:
-            X_val_flat = X_val.reshape(X_val.shape[0], -1)
-            y_pred_scaled = model.predict(X_val_flat)
-            y_pred = scaler.inverse_transform(y_pred_scaled)
-            y_true = scaler.inverse_transform(y_val)
-            
-            # Create a Directory for Plots
-            eval_dir = os.path.join(MODELS_DIR, f"{key}_eval_plots")
-            os.makedirs(eval_dir, exist_ok=True)
-            logger.info(f"   Generating plots in: {eval_dir}")
-            
-            global_mape = []
-            
-            # LOOP OVER EVERY SENSOR
-            for i, col_name in enumerate(all_cols):
-                # Calculate R2 for this specific sensor
-                sensor_r2 = r2_score(y_true[:, i], y_pred[:, i])
-                
-                # Calculate Safe MAPE
-                mask = np.abs(y_true[:, i]) > 0.01
-                if np.sum(mask) > 0:
-                    sensor_mape = np.mean(np.abs((y_true[mask, i] - y_pred[mask, i]) / y_true[mask, i])) * 100
-                    global_mape.append(sensor_mape)
-                else:
-                    sensor_mape = 0.0
+            X, y, cols = make_windows(wide, lookback=lookback, use_time_elapsed=use_time_elapsed)
+            if X.shape[0] == 0:
+                continue
 
-                # PLOT
-                plt.figure(figsize=(10, 4))
-                plt.plot(y_true[:, i], label='Actual', color='blue', alpha=0.7)
-                plt.plot(y_pred[:, i], label='Predicted', color='orange', linestyle='--', alpha=0.8)
-                plt.title(f"{col_name}\nR2: {sensor_r2:.2f} | MAPE: {sensor_mape:.1f}%")
-                plt.legend()
-                plt.grid(True, alpha=0.3)
-                
-                # Sanitize filename
-                safe_col = _norm_str(col_name)
-                plt.savefig(os.path.join(eval_dir, f"{safe_col}.png"))
-                # plt.savefig(os.path.join(eval_dir, f"{key}_{safe_col}_RANDOM_FOREST.png"))
-                plt.close()
-                
-            logger.info(f"   [RESULT] Global Avg MAPE: {np.mean(global_mape):.2f}%")
+            if cols_ref is None:
+                cols_ref = cols
+            else:
+                # Align columns to first batch’s columns (stable feature space)
+                # If a batch is missing a sensor col, add it with zeros.
+                missing = [c for c in cols_ref if c not in wide.columns and c != "meta_time_elapsed_sec"]
+                for c in missing:
+                    wide[c] = 0.0
+                # Ensure same order
+                if use_time_elapsed and "meta_time_elapsed_sec" not in wide.columns:
+                    t0 = wide.index.min()
+                    wide["meta_time_elapsed_sec"] = (wide.index - t0).total_seconds().astype(float)
+                wide = wide[[c for c in cols_ref if c in wide.columns]]
 
-        # --- F. Save ---
-        model_path, scaler_path, meta_path = _model_paths(f"{key}_OUTPUT", "RANDOM_FOREST")
-        _save_model_any(model, model_path, "RANDOM_FOREST", p3_1_log=logger)
+                X, y, _ = make_windows(wide, lookback=lookback, use_time_elapsed=False)  # already included if needed
+
+            all_X.append(X)
+            all_y.append(y)
+
+        if not all_X:
+            logger.info(f"Skipping drug='{drug}': no windows produced.")
+            continue
+
+        X_all = np.concatenate(all_X, axis=0)
+        y_all = np.concatenate(all_y, axis=0)
+
+        if X_all.shape[0] < int(min_points_per_drug):
+            logger.info(f"Skipping drug='{drug}': only {X_all.shape[0]} samples (<{min_points_per_drug}).")
+            continue
+
+        # Scale features for RF stability (robust)
+        scaler = RobustScaler()
+        X_flat = X_all.reshape(X_all.shape[0], -1)
+        X_scaled = scaler.fit_transform(X_flat)
+
+        # Train RF
+        model = train_rf_multioutput(
+            X=X_scaled.reshape(X_all.shape[0], X_all.shape[1], X_all.shape[2]),
+            y=y_all,
+            n_estimators=300,
+            random_state=42,
+        )
+
+        safe_drug = _safe_name(drug)
+        base_name = f"DRUG_{safe_drug}_OUTPUT__RANDOM_FOREST"
+
+        model_path = os.path.join(out_dir, f"{base_name}.pkl")
+        scaler_path = os.path.join(out_dir, f"{base_name}_scaler.pkl")
+        meta_path = os.path.join(out_dir, f"{base_name}_meta.json")
+
+        joblib.dump(model, model_path)
         joblib.dump(scaler, scaler_path)
-        
-        _save_meta(meta_path, {
-            "cols": all_cols,
-            "timesteps": CONFIG["LOOKBACK"],
-            "config": CONFIG,
-            "last_trained": datetime.now(timezone.utc).isoformat()
-        })
-        logger.info(f"   [SAVED] {key}")
+
+        meta = {
+            "created_utc": datetime.utcnow().isoformat() + "Z",
+            "drug_name": drug,
+            "lookback": int(lookback),
+            "resample_seconds": int(resample_seconds),
+            "resample_method": str(resample_method),
+            "inactive_strategy": str(inactive_strategy),
+            "use_time_elapsed": bool(use_time_elapsed),
+            "cols": cols_ref if cols_ref is not None else [],
+            "n_samples": int(X_all.shape[0]),
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"Saved: {model_path}")
+        logger.info(f"Saved: {scaler_path}")
+        logger.info(f"Saved: {meta_path}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True, help="Path to dw_tbl_raw_data csv (sample OK)")
+    ap.add_argument("--outdir", default="models", help="Output dir for models")
+    ap.add_argument("--lookback", type=int, default=20)
+    ap.add_argument("--resample_seconds", type=int, default=60)
+    ap.add_argument("--resample_method", type=str, default="last", choices=["last", "mean"])
+    ap.add_argument("--inactive_strategy", type=str, default="FFILL", choices=["FFILL", "ZERO"])
+    ap.add_argument("--use_time_elapsed", action="store_true")
+    ap.add_argument("--no_time_elapsed", action="store_true")
+    ap.add_argument("--min_points_per_drug", type=int, default=300)
+    args = ap.parse_args()
+
+    use_time = True
+    if args.no_time_elapsed:
+        use_time = False
+    if args.use_time_elapsed:
+        use_time = True
+
+    train_all_drugs(
+        csv_path=args.csv,
+        out_dir=args.outdir,
+        lookback=args.lookback,
+        resample_seconds=args.resample_seconds,
+        resample_method=args.resample_method,
+        inactive_strategy=args.inactive_strategy,
+        use_time_elapsed=use_time,
+        min_points_per_drug=args.min_points_per_drug,
+    )
+
 
 if __name__ == "__main__":
-    train_product_model(target_drug="Antares")
+    main()

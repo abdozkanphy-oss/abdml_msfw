@@ -1,103 +1,47 @@
-"""Replay a Kafka JSON dump through the realtime prediction code.
-
-Usage (from repo root):
-    python tools/replay_kafka_dump.py --path /mnt/data/kafka_message_dump.json --resample 60
-
-This runs in DRY-RUN mode (no Cassandra writes). It helps validate:
-- message parsing
-- batch id mapping (prod_order_reference_no)
-- model buffer + resampling path
-"""
-
 import argparse
 import json
-import importlib.util
+import os
+import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-PRED_PATH = ROOT / "thread" / "phase_3_correlation" / "_3_3_predictions.py"
+# Ensure repo root is on PYTHONPATH (fixes "No module named thread")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
-spec = importlib.util.spec_from_file_location("_3_3_predictions", str(PRED_PATH))
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-
-handle_realtime_prediction = mod.handle_realtime_prediction
-
-def _normalize_message(msg: dict) -> dict:
-    """Apply the same reference mapping we use in the Kafka consumer."""
-    if not isinstance(msg, dict):
-        return {}
-
-    # Canonical batch id
-    jo_ref = msg.get("joRef")
-    if jo_ref not in (None, "", "None"):
-        msg["prod_order_reference_no"] = jo_ref
-        msg.setdefault("job_order_reference_no", jo_ref)
-
-    ref_no = msg.get("refNo")
-    if ref_no not in (None, "", "None", 0, "0"):
-        msg["job_order_reference_no"] = ref_no
-
-    # Ensure output_stock fields exist (optional)
-    if "output_stock_no" not in msg or "output_stock_name" not in msg:
-        pl = msg.get("prodList")
-        if isinstance(pl, list) and pl and isinstance(pl[0], dict):
-            msg.setdefault("output_stock_no", pl[0].get("stNo"))
-            msg.setdefault("output_stock_name", pl[0].get("stNm"))
-
-    # operation fields
-    msg.setdefault("operationname", msg.get("opNm"))
-    msg.setdefault("operationno", msg.get("opNo"))
-    msg.setdefault("operationtaskcode", msg.get("opTc"))
-
-    # Timestamp: prefer measDt if present
-    if not msg.get("crDt"):
-        out = msg.get("outVals")
-        if isinstance(out, list) and out and isinstance(out[0], dict) and out[0].get("measDt"):
-            msg["crDt"] = out[0]["measDt"]
-
-    return msg
+from thread.phase_3_correlation._3_3_predictions import handle_realtime_prediction  # noqa
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--path", required=True, help="Path to kafka_message_dump.json")
-    ap.add_argument("--resample", type=int, default=60, help="Resample seconds (60 default)")
-    ap.add_argument("--lookback", type=int, default=20)
-    ap.add_argument("--epochs", type=int, default=3)
-    ap.add_argument("--min_train_points", type=int, default=60)
-    ap.add_argument("--algo", type=str, default="LSTM")
+    ap.add_argument("--resample", type=int, default=60, help="Resample seconds (informational; pipeline reads config too)")
+    ap.add_argument("--dry_run", action="store_true", help="Don't write anything; only run predictions")
     args = ap.parse_args()
 
-    p = Path(args.path)
-    payload = json.loads(p.read_text(encoding="utf-8"))
+    with open(args.path, "r", encoding="utf-8") as f:
+        msgs = json.load(f)
 
-    if isinstance(payload, dict) and "messages" in payload:
-        messages = payload["messages"]
-    elif isinstance(payload, list):
-        messages = payload
-    else:
-        raise ValueError("JSON must be a list of messages or {messages: [...]}.")
+    # The dump can be list or {"messages":[...]}
+    if isinstance(msgs, dict) and "messages" in msgs:
+        msgs = msgs["messages"]
+    if not isinstance(msgs, list):
+        raise ValueError("Dump must be a list of messages or {'messages': [...]}")
 
-    for i, raw in enumerate(messages, start=1):
-        msg = _normalize_message(dict(raw))
-        batch_id = msg.get("prod_order_reference_no") or msg.get("joRef") or msg.get("refNo") or "0"
-
-        status = handle_realtime_prediction(
-            message=msg,
-            lookback=args.lookback,
-            epochs=args.epochs,
-            min_train_points=args.min_train_points,
-            algorithm=args.algo,
-            seed_history=None,
-            scope="batch",
-            scope_id=str(batch_id),
+    for i, message in enumerate(msgs, start=1):
+        # Minimal scope setup: pid-level
+        pid = message.get("joOpId") or message.get("pid") or f"dump_{i}"
+        out = handle_realtime_prediction(
+            message=message,
+            scope="pid",
+            scope_id=pid,
             group_by_stock=True,
             resample_seconds=args.resample,
             dry_run=True,
         )
+        print(f"[{i}/{len(msgs)}] scope_id={pid} -> {out}")
 
-        print(f"[{i}/{len(messages)}] batch={batch_id} ok={status.get('ok')} wrote={status.get('wrote')} reason={status.get('reason')}")
+        if args.dry_run:
+            continue
 
 
 if __name__ == "__main__":

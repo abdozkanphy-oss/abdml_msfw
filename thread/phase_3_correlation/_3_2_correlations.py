@@ -17,6 +17,8 @@ from cassandra import ConsistencyLevel
 
 from utils.config_reader import ConfigReader
 from utils.logger_2 import setup_logger
+# from utils.logger import get_p3_1_logger
+# p3_1_log = get_p3_1_logger()
 
 # Helper functions for correlation matrix
 from thread.phase_3_correlation._3_1_helper_functions import map_to_text, compute_correlation, _is_input_type, aggregate_correlation_data
@@ -26,7 +28,7 @@ from thread.phase_3_correlation._3_3_predictions import handle_realtime_predicti
 from thread.phase_3_correlation._3_5_feature_importance import compute_and_save_feature_importance
 
 
-consumer3 = kafka_consumer3()
+consumer3 = None  # Kafka_init consumer
 NONE_LIMIT = 100   # 30 defa üst üste None → ~30 saniye
 
 cfg = ConfigReader()
@@ -91,9 +93,186 @@ RESAMPLE_SECONDS = int(getattr(cfg, "resample_seconds", 60) or 60)
 # - "batch": key prediction models by full batch id (prod_order_reference_no)
 PREDICTION_SCOPE_MODE = str(getattr(cfg, "prediction_scope_mode", "batch") or "batch").strip().lower()
 
+_FINALIZED_BATCHES = set()
+_LAST_PROD_MESSAGE_BY_BATCH = {}
+_BATCH_MESSAGE_BUFFER = {}
 
-#FIXCODE
+
+def finalize_batch_prediction(*, batch_id: str, last_prod_message: dict, batch_messages: list, p3_1_log):
+    """
+    Final, end-of-batch prediction.
+
+    - Builds hist_out = [(ts, {sensor_key: value, ...}), ...] from buffered Kafka messages.
+    - Calls handle_realtime_prediction() with algorithm=RANDOM_FOREST in scope='batch'
+      so it SAVES to Cassandra (via handle_realtime_prediction).
+    - Returns handle_realtime_prediction() result dict.
+    """
+
+    # ---------- local safe helpers (avoid undefined funcs) ----------
+    import re
+    from datetime import datetime, timezone
+
+    def _safe_float(v):
+        try:
+            if v is None:
+                return None
+            if isinstance(v, bool):
+                return float(int(v))
+            if isinstance(v, (int, float)):
+                return float(v)
+            s = str(v).strip().replace(",", ".")
+            if s in ("", "None", "nan", "NaN"):
+                return None
+            return float(s)
+        except Exception:
+            return None
+
+    def _norm_key_local(name):
+        if name is None:
+            return None
+        s = str(name).strip()
+        if not s or s in ("None", "nan", "NaN"):
+            return None
+        # normalize: spaces/dots/slashes -> underscore, collapse repeats
+        s = s.replace("\u00a0", " ")
+        s = re.sub(r"[^\w]+", "_", s, flags=re.UNICODE)
+        s = re.sub(r"_+", "_", s).strip("_")
+        return s or None
+
+    def _to_dt_local(v):
+        # prefer your module-level _to_dt if present
+        try:
+            return _to_dt(v)  # noqa: F821  (exists in this module)
+        except Exception:
+            pass
+
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+
+        # epoch s/ms
+        try:
+            s = int(v)
+            if s > 10**12:
+                return datetime.fromtimestamp(s / 1000.0, tz=timezone.utc)
+            return datetime.fromtimestamp(s, tz=timezone.utc)
+        except Exception:
+            pass
+
+        # iso
+        try:
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    # ---------- guardrails ----------
+    if not batch_id or str(batch_id) in ("", "None", "0"):
+        return {"ok": False, "wrote": False, "reason": "finalize_no_batch_id"}
+
+    batch_id = str(batch_id)
+
+    if batch_id in _FINALIZED_BATCHES:
+        return {"ok": True, "wrote": False, "reason": "finalize_already_done", "batch_id": batch_id}
+
+    if not last_prod_message or not isinstance(last_prod_message, dict):
+        return {"ok": False, "wrote": False, "reason": "finalize_no_last_prod_message", "batch_id": batch_id}
+
+    if not batch_messages:
+        p3_1_log.warning(f"[finalize_batch_prediction] batch_id={batch_id} -> batch_messages empty")
+        return {"ok": False, "wrote": False, "reason": "finalize_no_batch_messages", "batch_id": batch_id}
+
+    # ---------- build hist_out ----------
+    hist_out = []
+    bad_rows = 0
+    for m in batch_messages:
+        try:
+            if not isinstance(m, dict):
+                bad_rows += 1
+                continue
+
+            ts = _to_dt_local(m.get("crDt"))
+            if ts is None:
+                bad_rows += 1
+                continue
+
+            # ensure tz-aware
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+
+            row = {}
+            out_vals = m.get("outVals") or []
+            for o in out_vals:
+                if not isinstance(o, dict):
+                    continue
+                eq = o.get("eqNm") or o.get("equipment_name") or o.get("varNm")
+                k = _norm_key_local(eq)
+                if not k:
+                    continue
+                val = o.get("cntRead")
+                fv = _safe_float(val)
+                if fv is None:
+                    continue
+                row[k] = fv
+
+            if row:
+                hist_out.append((ts, row))
+        except Exception:
+            bad_rows += 1
+            continue
+
+    hist_out.sort(key=lambda x: x[0])
+
+    if not hist_out:
+        p3_1_log.warning(
+            f"[finalize_batch_prediction] batch_id={batch_id} -> no hist_out built "
+            f"(msgs={len(batch_messages)}, bad={bad_rows})"
+        )
+        return {"ok": False, "wrote": False, "reason": "finalize_no_history", "batch_id": batch_id}
+
+    p3_1_log.info(
+        f"[finalize_batch_prediction] batch_id={batch_id} "
+        f"msgs={len(batch_messages)} bad={bad_rows} hist_points={len(hist_out)} -> predicting+saving"
+    )
+
+    # ---------- read prediction params safely ----------
+    # Use config if present, else fallback.
+    lookback = 20
+    epochs = 50
+    min_train_points = 250
+    try:
+        from utils.config_reader import ConfigReader
+        cfg_obj = ConfigReader()
+        lookback = int(getattr(cfg_obj, "lookback", lookback) or lookback)
+        epochs = int(getattr(cfg_obj, "epochs", epochs) or epochs)
+        min_train_points = int(getattr(cfg_obj, "min_train_points", min_train_points) or min_train_points)
+    except Exception:
+        pass
+
+    # ---------- call prediction (this writes to Cassandra) ----------
+    res = handle_realtime_prediction(
+        message=last_prod_message,
+        lookback=lookback,
+        epochs=epochs,
+        min_train_points=min_train_points,
+        p3_1_log=p3_1_log,
+        algorithm="RANDOM_FOREST",
+        seed_history=hist_out,
+        scope="batch",
+        scope_id=batch_id,
+        group_by_stock=True,
+        resample_seconds=RESAMPLE_SECONDS,
+        dry_run=False,
+    )
+
+    _FINALIZED_BATCHES.add(batch_id)
+    return res
+
+
+# FIXCODE
 def _should_fire(buffer_entry, min_points, max_interval_sec, now_epoch=None):
+    import time
+
     if now_epoch is None:
         now_epoch = time.time()
 
@@ -104,7 +283,8 @@ def _should_fire(buffer_entry, min_points, max_interval_sec, now_epoch=None):
         first_seen = now_epoch
         buffer_entry["first_seen"] = first_seen
 
-    time_lapsed = float(now_epoch) - float(first_seen)
+    first_seen = float(first_seen)
+    time_lapsed = max(0.0, float(now_epoch) - first_seen)
 
     fire = (cnt >= int(min_points)) or (time_lapsed >= float(max_interval_sec))
     return fire, cnt, time_lapsed
@@ -115,6 +295,19 @@ p3_1_log = setup_logger(
 )
 
 RAW_TABLE = cfg["cassandra_props"]["raw_data_table"]  # "dw_tbl_raw_data"
+
+def _normalize_batch_id(x):
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s or s.lower() == "none":
+        return None
+    if s.isdigit():
+        try:
+            return str(int(s))   # 010330 → 10330
+        except Exception:
+            return s.lstrip("0") or "0"
+    return s
 
 
 # -------- Utilities -------- #
@@ -232,6 +425,7 @@ def _combine_input_output_lists(input_list, output_list):
     return combined
 # -------- DW'den fetch (PID-level, snapshot üzerinden) -------- #
 # ---------- STOCK HELPERS (NEW) ----------
+
 
 def _extract_stock_from_prodlist_message(prod_list):
     """
@@ -1037,7 +1231,7 @@ def _count_points_for_stock(sensor_values, stock_no: str) -> int:
             continue
         st = _clean_stock(meta.get("output_stock_no"))
         if st != stock_no:
-            #p3_1_log.debug(f"[_count_points_for_stock] Skipping bundle with stock_no={st}")
+            # p3_1_log.debug(f"[_count_points_for_stock] Skipping bundle with stock_no={st}")
             continue
 
         cr = meta.get("crDt")
@@ -1049,121 +1243,176 @@ def _count_points_for_stock(sensor_values, stock_no: str) -> int:
     return len(crdts) if crdts else cnt
 
 
-def fetch_for_optc_stock_via_dw(rows, input_list, output_list, _batch, 
-                                 op_tc=None, stock_no=None, 
-                                 ws_id=None, pid=None, max_rows: int = 20000):
+def fetch_for_optc_stock_via_dw(
+    rows,
+    input_list,
+    output_list,
+    _batch,
+    op_tc=None,
+    stock_no=None,
+    ws_id=None,
+    pid=None,
+    prod_order_reference_no=None,
+    max_rows: int = 20000,
+):
     """
-    Fetch data by operation task code + stock (NOT by single PID).
-    Optionally filter by ws_id or pid for additional constraints.
-    
-    This enables training across ALL PIDs with same op_tc + stock.
+    DW snapshot fetch filtered by (op_tc + stock) PLUS optional ws_id/pid PLUS optional batch id.
+
+    CRITICAL FIX:
+      - If prod_order_reference_no is provided, we only return rows belonging to that batch.
+      - We DO NOT use _combine_input_output_lists + zip(rows, combined_list) because it breaks row↔sensor alignment.
+      - We infer INPUT/OUTPUT directly from row.equipment_type using _is_input_type.
     """
-    bucket = defaultdict(list)
-    label_meta = {}
-    pid_by_ts = {}
-    ws_by_ts = {}
-    
-    # Clean inputs
-    op_tc = None if op_tc in (None, "", "None") else str(op_tc)
-    stock_no = None if stock_no in (None, "", "None", "nan", "NaN") else str(stock_no)
-    
+    # ---- normalize identifiers (avoid leading-zero mismatches) ----
+    def _norm_ref(x):
+        if x is None:
+            return None
+        s = str(x).strip()
+        if not s or s.lower() == "none":
+            return None
+        # If numeric-like, normalize by int to match "010330" vs 10330
+        if s.isdigit():
+            try:
+                return str(int(s))
+            except Exception:
+                return (s.lstrip("0") or "0")
+        return s
+
+    op_tc = None if op_tc in (None, "", "None") else str(op_tc).strip()
+    stock_no = None if stock_no in (None, "", "None", "nan", "NaN") else str(stock_no).strip()
+    batch_norm = _normalize_batch_id(prod_order_reference_no)
+
     if not op_tc or not stock_no:
         p3_1_log.warning(
             f"[fetch_for_optc_stock_via_dw] Missing op_tc={op_tc} or stock_no={stock_no}, returning empty"
         )
         return [], [], [], []
-    
-    combined_list = _combine_input_output_lists(input_list, output_list)
-    
-    for r, wrapped_ov in zip(rows, combined_list):
-        # ✅ PRIMARY FILTER: operation task code
+
+    bucket = defaultdict(list)   # ts -> [sensor_dict, ...]
+    label_meta = {}              # ts -> meta dict
+    pid_by_ts = {}
+    ws_by_ts = {}
+
+    # rows already limited by fetchData(limit=...), but keep a defensive cap
+    used = 0
+
+    for r in rows or []:
+        if used >= max_rows:
+            break
+
+        # ---- PRIMARY FILTERS ----
         row_optc = getattr(r, "operationtaskcode", None)
         if row_optc != op_tc:
             continue
-        
-        # ✅ PRIMARY FILTER: stock
+
         row_stock = getattr(r, "produced_stock_no", None)
-        row_stock = None if row_stock in (None, "", "None", "nan", "NaN") else str(row_stock)
+        row_stock = None if row_stock in (None, "", "None", "nan", "NaN") else str(row_stock).strip()
         if row_stock != stock_no:
             continue
-        
-        # ✅ OPTIONAL FILTER: workstation (eğer belirtilmişse)
+
+        # ---- OPTIONAL FILTERS ----
         if ws_id is not None:
             row_ws = getattr(r, "work_station_id", None) or getattr(r, "workstation_id", None)
             if row_ws != ws_id:
                 continue
-        
-        # ✅ OPTIONAL FILTER: pid (eğer sadece o PID'i istiyorsak - genelde istemeyiz)
+
         if pid is not None:
             row_pid = getattr(r, "job_order_operation_id", None)
             if row_pid != pid:
                 continue
-        
+
+        row_batch = getattr(r, "prod_order_reference_no", None)
+        if batch_norm is not None:
+            if _normalize_batch_id(row_batch) != batch_norm:
+                continue
+
         ts = getattr(r, "measurement_date", None)
         if ts is None:
             continue
-        
-        # Track which PID/WS this timestamp belongs to
+
+        # Track PID/WS per timestamp (best-effort)
         if ts not in pid_by_ts:
             pid_by_ts[ts] = getattr(r, "job_order_operation_id", None)
         if ts not in ws_by_ts:
-            ws_by_ts[ts] = getattr(r, "work_station_id", None)
-        
-        # Label/meta
+            ws_by_ts[ts] = getattr(r, "work_station_id", None) or getattr(r, "workstation_id", None)
+
+        # Meta per timestamp
         if ts not in label_meta:
+            st_nm = getattr(r, "produced_stock_name", None)
             label_meta[ts] = {
                 "good": getattr(r, "good", None),
                 "prSt": getattr(r, "workstation_state", None),
                 "job_order_reference_no": getattr(r, "job_order_reference_no", None),
                 "prod_order_reference_no": getattr(r, "prod_order_reference_no", None),
                 "output_stock_no": row_stock,
-                "output_stock_name": getattr(r, "produced_stock_name", None),
+                "output_stock_name": (None if st_nm in (None, "", "None") else str(st_nm)),
                 "operationname": getattr(r, "operationname", None),
                 "operationno": getattr(r, "operationno", None),
                 "operationtaskcode": row_optc,
                 "job_order_operation_id": getattr(r, "job_order_operation_id", None),
                 "work_station_id": getattr(r, "work_station_id", None) or getattr(r, "workstation_id", None),
             }
-        
-        # Sensor data
-        ov = wrapped_ov[0] if wrapped_ov else {}
-        if ov.get("equipment_type", True):  # INPUT
-            var_name = ov.get("varNo")
-            var_value = ov.get("genReadVal")
-            
-            if var_name and var_value is not None:
-                bucket[ts].append({
-                    "parameter": str(var_name),
-                    "counter_reading": _num_text(var_value),
-                    "equipment_name": ov.get("varNm", var_name),
+
+        # Sensor extraction from row fields
+        equipment_type = getattr(r, "equipment_type", None)
+        is_input = _is_input_type(equipment_type)
+
+        eq_no = getattr(r, "equipment_no", None)
+        eq_nm = getattr(r, "equipment_name", None)
+
+        if is_input:
+            # INPUT: prefer gen_read_val, fallback to counter_reading if needed
+            val = getattr(r, "gen_read_val", None)
+            if val is None:
+                val = getattr(r, "counter_reading", None)
+            if val is None:
+                continue
+
+            param = eq_no or eq_nm
+            if not param:
+                continue
+
+            bucket[ts].append(
+                {
+                    "parameter": str(param),
+                    "counter_reading": _num_text(val),
+                    "equipment_name": str(eq_nm or param),
                     "equipment_type": True,
-                })
-        else:  # OUTPUT
-            param = ov.get("eqNo")
-            cval = ov.get("cntRead")
-            eq_name = ov.get("eqNm")
-            
-            if param and cval is not None:
-                bucket[ts].append({
+                }
+            )
+        else:
+            # OUTPUT: use counter_reading
+            cval = getattr(r, "counter_reading", None)
+            if cval is None:
+                continue
+
+            param = eq_no or getattr(r, "parameter", None) or eq_nm
+            if not param:
+                continue
+
+            bucket[ts].append(
+                {
                     "parameter": str(param),
                     "counter_reading": _num_text(cval),
-                    "equipment_name": str(eq_name),
+                    "equipment_name": str(eq_nm or param),
                     "equipment_type": False,
-                })
-    
+                }
+            )
+
+        used += 1
+
     if not bucket:
         p3_1_log.info(
-            f"[fetch_for_optc_stock_via_dw] 0 rows for op_tc={op_tc}, stock={stock_no}"
+            f"[fetch_for_optc_stock_via_dw] 0 bundles for op_tc={op_tc}, stock={stock_no}, ws_id={ws_id}, pid={pid}, batch={prod_order_reference_no}"
         )
         return [], [], [], []
-    
+
     job_ids, dates, ids, sensor_values = [], [], [], []
-    
     for ts in sorted(bucket.keys()):
         sensors = bucket[ts]
         if not sensors:
             continue
-        
+
         lm = label_meta.get(ts, {}) or {}
         meta = {
             "measurement_date": ts,
@@ -1180,77 +1429,101 @@ def fetch_for_optc_stock_via_dw(rows, input_list, output_list, _batch,
             "job_order_operation_id": lm.get("job_order_operation_id"),
             "work_station_id": lm.get("work_station_id"),
         }
-        
+
         job_ids.append(pid_by_ts.get(ts) or 0)
         dates.append(ts)
         ids.append(uuid.uuid4())
         sensor_values.append([_map_to_text(meta)] + [_map_to_text(s) for s in sensors])
-    
+
     p3_1_log.info(
-        f"[fetch_for_optc_stock_via_dw] Found {len(sensor_values)} bundles for "
-        f"op_tc={op_tc}, stock={stock_no}, ws_id={ws_id}, pid={pid}"
+        f"[fetch_for_optc_stock_via_dw] Found {len(sensor_values)} bundles "
+        f"for op_tc={op_tc}, stock={stock_no}, ws_id={ws_id}, "
+        f"pid={pid}, batch={prod_order_reference_no}"
     )
+
     return job_ids, dates, ids, sensor_values
 
-def build_sensor_values_from_buffer_for_optc_stock(messages, op_tc=None, stock_no=None, 
-                                                     ws_id=None, pid=None):
+
+def build_sensor_values_from_buffer_for_optc_stock(
+    messages,
+    op_tc=None,
+    stock_no=None,
+    ws_id=None,
+    pid=None,
+    prod_order_reference_no=None,  # <-- ADD
+):
+    def _norm_ref(x):
+        if x is None:
+            return None
+        s = str(x).strip()
+        if not s or s.lower() == "none":
+            return None
+        if s.isdigit():
+            try:
+                return str(int(s))
+            except Exception:
+                return (s.lstrip("0") or "0")
+        return s
+
+    batch_norm = _norm_ref(prod_order_reference_no)
     """
     Build sensor_values from buffered messages filtered by op_tc + stock.
     Optionally filter by ws_id or pid.
     """
     op_tc = None if op_tc in (None, "", "None") else str(op_tc)
     stock_no = None if stock_no in (None, "", "None", "nan", "NaN") else str(stock_no)
-    
+
     if not op_tc or not stock_no:
         p3_1_log.warning(
             f"[build_sensor_values_from_buffer_for_optc_stock] Missing op_tc or stock_no"
         )
         return [], [], [], []
-    
+
     bucket = defaultdict(list)
     label_meta = {}
     pid_by_ts = {}
-    
+
     for msg in messages or []:
-        # ✅ Filter by operation task code
         msg_optc = msg.get("operationtaskcode") or msg.get("opTc")
         if msg_optc != op_tc:
             continue
-        
-        # ✅ Filter by stock
+
         msg_stock, msg_stock_name = _extract_stock_from_prodlist_message(msg.get("prodList"))
         msg_stock = None if msg_stock in (None, "", "None", "nan", "NaN") else str(msg_stock)
         if msg_stock != stock_no:
             continue
-        
-        # ✅ Optional filter by workstation
+
         if ws_id is not None:
             msg_ws = msg.get("wsId")
             if msg_ws != ws_id:
                 continue
-        
-        # ✅ Optional filter by pid
+
         if pid is not None:
             msg_pid = msg.get("joOpId")
             if msg_pid != pid:
                 continue
-        
+
+        if batch_norm is not None:
+            msg_batch = msg.get("prod_order_reference_no") or msg.get("refNo")
+            if _norm_ref(msg_batch) != batch_norm:
+                continue
+
         # Extract inputs and outputs
         out_vals = msg.get("outVals") or []
         in_vars = _extract_invars_from_message(msg)
-        
+
         if not out_vals and not in_vars:
             continue
-        
+
         meas_ms = (out_vals[0].get("measDt") if out_vals else None) or msg.get("crDt")
         ts = _to_dt(meas_ms)
         if ts is None:
             continue
-        
+
         # Track PID for this timestamp
         if ts not in pid_by_ts:
             pid_by_ts[ts] = msg.get("joOpId")
-        
+
         if ts not in label_meta:
             label_meta[ts] = {
                 "good": msg.get("goodCnt"),
@@ -1265,13 +1538,13 @@ def build_sensor_values_from_buffer_for_optc_stock(messages, op_tc=None, stock_n
                 "job_order_operation_id": msg.get("joOpId"),
                 "work_station_id": msg.get("wsId"),
             }
-        
+
         # Add OUTPUTS
         for ov in out_vals:
             pname = ov.get("eqNo")
             cval = ov.get("cntRead")
             eq_name = ov.get("eqNm")
-            
+
             if pname and cval is not None:
                 bucket[ts].append({
                     "parameter": str(pname),
@@ -1279,7 +1552,7 @@ def build_sensor_values_from_buffer_for_optc_stock(messages, op_tc=None, stock_n
                     "equipment_name": str(eq_name),
                     "equipment_type": False,
                 })
-        
+
         # Add INPUTS
         for iv in in_vars:
             bucket[ts].append({
@@ -1288,21 +1561,21 @@ def build_sensor_values_from_buffer_for_optc_stock(messages, op_tc=None, stock_n
                 "equipment_name": iv['var_name'],
                 "equipment_type": True,
             })
-    
+
     if not bucket:
         p3_1_log.info(
             f"[build_sensor_values_from_buffer_for_optc_stock] 0 bundles for "
             f"op_tc={op_tc}, stock={stock_no}"
         )
         return [], [], [], []
-    
+
     job_ids, dates, ids, sensor_values = [], [], [], []
-    
+
     for ts in sorted(bucket.keys()):
         sensors = bucket[ts]
         if not sensors:
             continue
-        
+
         lm = label_meta.get(ts, {})
         meta = {
             "measurement_date": ts,
@@ -1319,17 +1592,18 @@ def build_sensor_values_from_buffer_for_optc_stock(messages, op_tc=None, stock_n
             "job_order_operation_id": lm.get("job_order_operation_id"),
             "work_station_id": lm.get("work_station_id"),
         }
-        
+
         job_ids.append(pid_by_ts.get(ts) or 0)
         dates.append(ts)
         ids.append(uuid.uuid4())
         sensor_values.append([_map_to_text(meta)] + [_map_to_text(s) for s in sensors])
-    
+
     p3_1_log.info(
         f"[build_sensor_values_from_buffer_for_optc_stock] Built {len(sensor_values)} bundles "
         f"for op_tc={op_tc}, stock={stock_no}"
     )
     return job_ids, dates, ids, sensor_values
+
 
 def fetch_latest_for_optc_stock_via_raw_table(
     op_tc,
@@ -1338,6 +1612,7 @@ def fetch_latest_for_optc_stock_via_raw_table(
     max_rows=20000,
     ws_id=None,
     pid=None,
+    prod_order_reference_no=None, 
 ):
     """
     Fetch data from RAW_TABLE filtered by operation task code + stock.
@@ -1355,45 +1630,88 @@ def fetch_latest_for_optc_stock_via_raw_table(
         )
         return [], [], [], []
 
-    # Build WHERE clause dynamically
-    where = "WHERE operationtaskcode = %s AND produced_stock_no = %s"
-    params = [op_tc, stock_no]
+    def _batch_variants(x):
+        if x is None:
+            return []
+        s = str(x).strip()
+        if not s or s.lower() == "none":
+            return []
+        out = [s]
+        if s.isdigit():
+            try:
+                s_int = str(int(s))  # 010330 -> 10330
+            except Exception:
+                s_int = (s.lstrip("0") or "0")
+            if s_int not in out:
+                out.append(s_int)
+
+            # Common padding length observed in this project: 6
+            if len(s) < 6:
+                z = s.zfill(6)
+                if z not in out:
+                    out.append(z)
+            if len(s_int) < 6:
+                z2 = s_int.zfill(6)
+                if z2 not in out:
+                    out.append(z2)
+        return out
+
+    # Build WHERE clause dynamically (base filters)
+    base_where = "WHERE operationtaskcode = %s AND produced_stock_no = %s"
+    base_params = [op_tc, stock_no]
 
     if ws_id is not None:
-        where += " AND work_station_id = %s"
-        params.append(ws_id)
-    
-    #if pid is not None:
-        #where += " AND job_order_operation_id = %s"
-        #params.append(pid)
+        base_where += " AND work_station_id = %s"
+        base_params.append(ws_id)
 
-    query = (
+    select_sql = (
         f"SELECT job_order_operation_id, work_station_id, measurement_date, "
         f"equipment_no, equipment_name, counter_reading, gen_read_val, equipment_type, "
         f"good, workstation_state, job_order_reference_no, prod_order_reference_no, "
         f"produced_stock_no, produced_stock_name, operationname, operationno, operationtaskcode "
         f"FROM {RAW_TABLE} "
-        f"{where} "
-        f"LIMIT %s ALLOW FILTERING"
     )
 
-    params.append(max_rows)
+    rows = []
+    used_batch = None
 
     try:
-        rows = list(session.execute(query, tuple(params)))
+        if prod_order_reference_no is None:
+            where = base_where
+            params = list(base_params)
+            query = f"{select_sql} {where} LIMIT %s ALLOW FILTERING"
+            params.append(max_rows)
+            rows = list(session.execute(query, tuple(params)))
+        else:
+            for b in _batch_variants(prod_order_reference_no):
+                where = base_where + " AND prod_order_reference_no = %s"
+                params = list(base_params) + [b]
+                query = f"{select_sql} {where} LIMIT %s ALLOW FILTERING"
+                params.append(max_rows)
+                tmp = list(session.execute(query, tuple(params)))
+                if tmp:
+                    rows = tmp
+                    used_batch = b
+                    break
     except Exception as e:
         p3_1_log.warning(
             f"[fetch_latest_for_optc_stock_via_raw_table] query failed for "
-            f"op_tc={op_tc}, stock={stock_no}: {e}"
+            f"op_tc={op_tc}, stock={stock_no}, ws_id={ws_id}, batch={prod_order_reference_no}: {e}"
         )
         return [], [], [], []
 
     if not rows:
         p3_1_log.info(
             f"[fetch_latest_for_optc_stock_via_raw_table] 0 rows for "
-            f"op_tc={op_tc}, stock={stock_no}, ws_id={ws_id}, pid={pid}"
+            f"op_tc={op_tc}, stock={stock_no}, ws_id={ws_id}, pid={pid}, batch={prod_order_reference_no}"
         )
         return [], [], [], []
+
+    if prod_order_reference_no is not None:
+        p3_1_log.info(
+            f"[fetch_latest_for_optc_stock_via_raw_table] batch filter matched using variant={used_batch!r} "
+            f"(requested={prod_order_reference_no!r}) rows={len(rows)}"
+        )
 
     bucket = defaultdict(list)
     label_meta = {}
@@ -1504,10 +1822,10 @@ def fetch_latest_for_optc_stock_via_raw_table(
         sensor_values.append([_map_to_text(meta)] + [_map_to_text(s) for s in sensors])
 
     p3_1_log.info(
-        f"[fetch_latest_for_optc_stock_via_raw_table] rows={len(rows)}, "
-        f"bundles={len(sensor_values)} for op_tc={op_tc}, stock={stock_no}, "
-        f"ws_id={ws_id}, pid={pid}"
+        f"[fetch_latest_for_optc_stock_via_raw_table] rows={len(rows)}, bundles={len(sensor_values)} "
+        f"for op_tc={op_tc}, stock={stock_no}, ws_id={ws_id}, pid={pid}, batch={prod_order_reference_no}"
     )
+
     return job_ids, dates, ids, sensor_values
 
 def _is_message_valid(message):
@@ -1542,465 +1860,589 @@ def _is_message_valid(message):
 
     return True
 
+def _predict_and_save_every_message(
+    *,
+    message: dict,
+    pid,
+    batch_id: str,
+    p3_1_log,
+    resample_seconds: int,
+    scope_mode: str,
+):
+    """
+    Fast-path: for EVERY Kafka message we attempt prediction and (if non-empty) save to Cassandra.
+
+    - Keeps existing throttled tasks intact (correlation/FI/etc)
+    - Uses RANDOM_FOREST (current focus)
+    - Uses scope_mode:
+        * 'batch' -> scope='batch', scope_id=batch_id
+        * 'pid'   -> scope='pid',   scope_id=pid
+    """
+    try:
+        algo = "RANDOM_FOREST"
+
+        scope_mode = (scope_mode or "batch").strip().lower()
+        if scope_mode == "pid":
+            scope = "pid"
+            scope_id = str(pid)
+            group_by_stock = True
+        else:
+            scope = "batch"
+            scope_id = str(batch_id)
+            group_by_stock = True
+
+        res = handle_realtime_prediction(
+            message=message,
+            p3_1_log=p3_1_log,
+            algorithm=algo,
+            scope=scope,
+            scope_id=scope_id,
+            group_by_stock=group_by_stock,
+            resample_seconds=int(resample_seconds or 60),
+            dry_run=False,
+        )
+
+        # Useful single-line status for debugging
+        if p3_1_log:
+            p3_1_log.info(
+                f"[execute_phase_three][FAST_PRED] scope={scope} scope_id={scope_id} "
+                f"ok={res.get('ok')} wrote={res.get('wrote')} reason={res.get('reason')}"
+            )
+
+        return res
+
+    except Exception as e:
+        if p3_1_log:
+            p3_1_log.error(f"[execute_phase_three][FAST_PRED] failed: {e}", exc_info=True)
+        return {"ok": False, "wrote": False, "reason": f"fast_pred_error:{e}"}
+
+
 # -------- Phase 3 main loop -------- #
 def execute_phase_three():
+    """
+    Phase 3 live loop:
+    - Poll Kafka
+    - Normalize message (plId filter optional, refNo/joRef mapping)
+    - Persist raw message to Cassandra raw table
+    - Buffer per pid (joOpId) and per wsId
+    - Fire PID/WS tasks using _should_fire()
+    - Fetch history via (DW snapshot -> RAW_TABLE fallback -> buffer fallback)
+    - Run correlations + realtime predictions (+ FI) via _run_3_tasks_and_wait()
+
+    Notes:
+    - This function assumes the helper functions/vars already exist in this module,
+      as in your current detailed codebase:
+        kafka_consumer3, dw_tbl_raw_data, _is_message_valid, _extract_stock_from_prodlist_message,
+        _to_dt, _should_fire, fetch_for_optc_stock_via_dw, fetch_latest_for_optc_stock_via_raw_table,
+        build_sensor_values_from_buffer_for_optc_stock, fetch_latest_for_ws_via_dw,
+        fetch_latest_for_ws_via_raw_table, build_sensor_values_from_ws_buffer,
+        _clean_stock, _sensor_values_has_stock, _count_points_for_stock, _run_3_tasks_and_wait,
+        buffer_for_process, buffer_for_ws,
+        NONE_LIMIT, PID_COUNT_THRESHOLD, PID_TIME_THRESHOLD, WS_COUNT_THRESHOLD, WS_TIME_THRESHOLD.
+    """
     p3_1_log.info("[execute_phase_three] Initializing Phase 3")
 
     global consumer3
 
-    # İlk başta DW snapshot'ı al
+    # ---------------------------------------------------------------------
+    # 0) Take an initial DW snapshot (fast cache). RAW_TABLE fallback exists.
+    # ---------------------------------------------------------------------
     try:
         rows, input_list, output_list, _batch = dw_tbl_raw_data.fetchData(limit=20_000)
+        p3_1_log.info(f"[execute_phase_three] DW snapshot loaded rows={len(rows) if rows else 0}")
     except Exception as e:
-        p3_1_log.error(f"[dw_tbl_raw_data.fetchData] fetchData failed: {e}")
-        return [], [], [], []
+        p3_1_log.error(f"[execute_phase_three] dw_tbl_raw_data.fetchData failed: {e}", exc_info=True)
+        return
 
-    # Ardışık None sayacı
+    # ---------------------------------------------------------------------
+    # 1) Ensure consumer exists (IMPORTANT: do not create at import-time)
+    # ---------------------------------------------------------------------
+    if consumer3 is None:
+        consumer3 = kafka_consumer3()
+
     none_counter = 0
 
-    try:
-        while True:        
-            # 1) Kafka'dan mesaj çek
-            msg = consumer3.poll(1.0)
-            # ---- NONE HANDLING (soft restart) ----
-            if msg is None:
-                none_counter += 1
-                p3_1_log.warning(
-                    f"[execute_phase_three] Kafka Message is None "
-                    f"(consecutive={none_counter})"
-                )
-
-                if none_counter >= NONE_LIMIT:
-                    p3_1_log.warning(
-                        "[execute_phase_three] Too many consecutive None messages "
-                        f"({none_counter}), restarting Kafka consumer"
-                    )
-                    # Eski consumer'i kapat
-                    try:
-                        consumer3.close()
-                    except Exception as e:
-                        p3_1_log.warning(
-                            f"[execute_phase_three] Error while closing consumer: {e}"
-                        )
-
-                    # Aynı group.id ve config ile yeni consumer
-                    try:
-                        consumer3 = kafka_consumer3()
-                        p3_1_log.info(
-                            "[execute_phase_three] Kafka consumer recreated successfully "
-                            "after None storm"
-                        )
-                    except Exception as e:
-                        p3_1_log.error(
-                            f"[execute_phase_three] Failed to recreate consumer: {e}",
-                            exc_info=True,
-                        )
-
-                    # Sayaç sıfırlansın, buffer'lara dokunmuyoruz
-                    none_counter = 0
-
-                # Bu iterasyonu atla
+    while True:
+        # If consumer disappeared, recreate
+        if consumer3 is None:
+            p3_1_log.warning("[execute_phase_three] consumer3 is None -> recreating")
+            consumer3 = kafka_consumer3()
+            if consumer3 is None:
+                p3_1_log.error("[execute_phase_three] kafka_consumer3() returned None; retrying in 2s")
+                time.sleep(2.0)
                 continue
 
-            # Buraya geldiysek gerçek bir mesaj var, sayaç sıfırla
-            none_counter = 0
+        # -------------------------
+        # Poll Kafka
+        # -------------------------
+        try:
+            msg = consumer3.poll(1.0)
+        except Exception as e:
+            p3_1_log.error(f"[execute_phase_three] consumer.poll failed: {e}", exc_info=True)
+            try:
+                consumer3.close()
+            except Exception:
+                pass
+            consumer3 = None
+            time.sleep(2.0)
+            continue
 
-            # ---- ERROR HANDLING (opsiyonel: burada da restart edebilirsin) ----
-            if msg.error():
-                p3_1_log.error(
-                    f"[execute_phase_three] Errornous Message: {msg.error()}"
+        # -------------------------
+        # None handling
+        # -------------------------
+        if msg is None:
+            none_counter += 1
+
+            # Poll returning None is normal when topic is idle; log occasionally.
+            if none_counter in (1, 10, 30, 60) or none_counter % 300 == 0:
+                p3_1_log.warning(f"[execute_phase_three] Kafka Message is None (consecutive={none_counter})")
+            else:
+                p3_1_log.debug(f"[execute_phase_three] Kafka Message is None (consecutive={none_counter})")
+
+            # Soft restart if too many consecutive None
+            if none_counter >= NONE_LIMIT:
+                p3_1_log.warning(
+                    f"[execute_phase_three] Too many consecutive None messages ({none_counter}); restarting Kafka consumer"
                 )
-                # İstersen burada da aynı soft-restart mantığını kullan:
                 try:
                     consumer3.close()
                 except Exception as e:
-                    p3_1_log.warning(
-                        f"[execute_phase_three] Error while closing consumer after error: {e}"
-                    )
-                try:
-                    consumer3 = kafka_consumer3()
-                    p3_1_log.info(
-                        "[execute_phase_three] Kafka consumer recreated after error"
-                    )
-                except Exception as e:
-                    p3_1_log.error(
-                        f"[execute_phase_three] Failed to recreate consumer after error: {e}",
-                        exc_info=True,
-                    )
-                continue
-            
-            """try:
-                rows, input_list, output_list, _batch = dw_tbl_raw_data.fetchData(limit=20_000)
-            except Exception as e:
-                p3_1_log.error(f"[dw_tbl_raw_data.fetchData] fetchData failed: {e}")
-                return [], [], [], []"""
-            
+                    p3_1_log.warning(f"[execute_phase_three] Error while closing consumer: {e}")
+                consumer3 = None
+                none_counter = 0
+            continue
+
+        # got a message
+        none_counter = 0
+
+        # -------------------------
+        # Error handling
+        # -------------------------
+        if msg.error():
+            p3_1_log.error(f"[execute_phase_three] Erroneous Message: {msg.error()}")
+
+            # optional: hard restart after error
             try:
-                raw_value = msg.value().decode("utf-8")
-                message = json.loads(raw_value)
+                consumer3.close()
+            except Exception:
+                pass
+            consumer3 = None
+            continue
 
-                if not _is_message_valid(message):
-                    p3_1_log.info("[execute_phase_three] Skipping invalid message")
-                    continue
+        # -------------------------
+        # Decode JSON
+        # -------------------------
+        try:
+            raw_value = msg.value()
+            if raw_value is None:
+                p3_1_log.warning("[execute_phase_three] msg.value() is None -> skip")
+                continue
 
-                if message.get("plId") and message["plId"] != 76:
-                    p3_1_log.info("[execute_phase_three] Skipping Savola customer")
-                    continue
+            if isinstance(raw_value, dict):
+                message = raw_value
+            else:
+                message = json.loads(raw_value.decode("utf-8"))
+        except Exception as e:
+            p3_1_log.error(f"[execute_phase_three] Failed to decode Kafka message: {e}", exc_info=True)
+            continue
 
-                # if "joRef" in message and message.get("joRef") not in (None, "", "None"):
-                #     message["prod_order_reference_no"] = message["joRef"]
-                #     message.setdefault("job_order_reference_no", message["joRef"])
+        # -------------------------
+        # Validate schema early
+        # -------------------------
+        try:
+            if not _is_message_valid(message):
+                p3_1_log.info("[execute_phase_three] Skipping invalid message")
+                continue
+        except Exception as e:
+            p3_1_log.warning(f"[execute_phase_three] _is_message_valid exception: {e} -> skipping", exc_info=True)
+            continue
 
-                # if "refNo" in message and message.get("refNo") not in (None, "", "None", 0, "0"):
-                #     message["job_order_reference_no"] = message["refNo"]
+        # -------------------------
+        # Optional test-plant filter (keep it if you need it)
+        # -------------------------
+        pl_raw = message.get("plId")
+        pl_id = None
+        try:
+            pl_id = int(pl_raw) if pl_raw not in (None, "", "None") else None
+        except Exception:
+            pl_id = None
 
-                # If refNo is empty/0, promote joRef into refNo so legacy logic continues unchanged.
-                if message.get("joRef") not in (None, "", "None") and message.get("refNo") in (None, "", "None", 0, "0"):
-                    message["refNo"] = message["joRef"]
+        # If you use the "test topic plant 76 only" rule, keep this on:
+        # (Otherwise, comment out.)
+        if pl_id is not None and pl_id != 149:
+            p3_1_log.info("[execute_phase_three] Skipping non-test plant (plId != 149)")
+            continue
 
-                # Canonical batch key (your definition)
-                if message.get("refNo") not in (None, "", "None", 0, "0"):
-                    message["prod_order_reference_no"] = message["refNo"]
-                    message.setdefault("job_order_reference_no", message["refNo"])
+        # -------------------------
+        # Normalize reference numbers (batch identity)
+        # -------------------------
+        # If refNo is empty/0, promote joRef into refNo so main logic stays stable.
+        if message.get("joRef") not in (None, "", "None", 0, "0") and message.get("refNo") in (None, "", "None", 0, "0"):
+            message["refNo"] = message["joRef"]
 
-                # If we still have no batch reference, normalize to 0 to avoid KeyErrors downstream.
-                if not message.get("prod_order_reference_no"):
-                    message["job_order_reference_no"] = message.get("job_order_reference_no") or 0
-                    message["prod_order_reference_no"] = 0
-                    message["joRef"] = message.get("joRef") or 0
-                    message["refNo"] = message.get("refNo") or 0
+        # Canonical batch key
+        if message.get("refNo") not in (None, "", "None", 0, "0"):
+            message["prod_order_reference_no"] = str(message["refNo"])
+            message.setdefault("job_order_reference_no", str(message["refNo"]))
 
-                # NEW: extract stock from prodList and put on message
-                st_no, st_nm = _extract_stock_from_prodlist_message(
-                    message.get("prodList")
+        # If still missing, normalize to something safe
+        if not message.get("prod_order_reference_no"):
+            message["job_order_reference_no"] = message.get("job_order_reference_no") or 0
+            message["prod_order_reference_no"] = 0
+            message["joRef"] = message.get("joRef") or 0
+            message["refNo"] = message.get("refNo") or 0
+
+        # -------------------------
+        # Extract stock from prodList and attach to message
+        # -------------------------
+        try:
+            st_no, st_nm = _extract_stock_from_prodlist_message(message.get("prodList"))
+        except Exception:
+            st_no, st_nm = None, None
+        message["output_stock_no"] = st_no
+        message["output_stock_name"] = st_nm
+
+        # Normalize operation fields expected by downstream code
+        message["operationname"] = message.get("opNm")
+        message["operationno"] = message.get("opNo")
+        message["operationtaskcode"] = message.get("opTc")
+
+        # ---------------------------------------------------------------------
+        # Save raw Kafka message into Cassandra raw table (DW)
+        # ---------------------------------------------------------------------
+        try:
+            _ = dw_tbl_raw_data.saveData(message)
+        except Exception as e:
+            # For live Kafka, we do NOT want a Cassandra hiccup to kill the loop.
+            p3_1_log.error(f"[execute_phase_three] dw_tbl_raw_data.saveData failed: {e}", exc_info=True)
+
+        # ---------------------------------------------------------------------
+        # Extract core routing identifiers
+        # ---------------------------------------------------------------------
+        wsSt = message.get("prSt")        # production state (e.g. "PRODUCTION")
+        pid = message.get("joOpId")       # operation instance id (pid)
+        ws_id = message.get("wsId")       # workstation id
+        crDt_msg = _to_dt(message.get("crDt"))
+        now_epoch = time.time()
+
+        if pid in (None, "", "None"):
+            p3_1_log.warning("[execute_phase_three] Missing joOpId (pid). Skipping message.")
+            continue
+
+        # Canonical batch id (used for scope_mode='batch' predictions and any buffering)
+        batch_id = str(
+            message.get("prod_order_reference_no")
+            or message.get("refNo")
+            or message.get("joRef")
+            or "0"
+        )
+
+        # ---------------------------------------------------------------------
+        # FAST PATH: predict & save for EVERY message (in addition to throttled tasks)
+        # ---------------------------------------------------------------------
+        _predict_and_save_every_message(
+            message=message,
+            pid=pid,
+            batch_id=batch_id,
+            p3_1_log=p3_1_log,
+            resample_seconds=RESAMPLE_SECONDS,
+            scope_mode=PREDICTION_SCOPE_MODE,   # respects config.json: 'batch' or 'pid'
+        )
+
+        cnt = buffer_for_process.get(pid, {}).get("count", 0)
+        p3_1_log.info(
+            f"[execute_phase_three] Incoming -- plId={message.get('plId')}, "
+            f"batch={message.get('prod_order_reference_no')}, pid={pid}, wsId={ws_id}, wsSt={wsSt}, "
+            f"in_pid_buffer={pid in buffer_for_process}, count={cnt}, stock={message.get('output_stock_name')}"
+        )
+
+        # ---------------------------------------------------------------------
+        # Buffer management
+        # ---------------------------------------------------------------------
+        batch_id = str(message.get("prod_order_reference_no") or message.get("refNo") or message.get("joRef") or "0")
+        if wsSt == "PRODUCTION":
+            _LAST_PROD_MESSAGE_BY_BATCH[batch_id] = message
+            # collect messages for finalize
+            _BATCH_MESSAGE_BUFFER.setdefault(batch_id, []).append(message)
+            # --- PID buffer ---
+            if pid not in buffer_for_process:
+                buffer_for_process[pid] = {
+                    "count": 1,
+                    "first_seen": now_epoch,
+                    "last_time": now_epoch,
+                    "first_crdt": crDt_msg,
+                    "messages": [message],
+                }
+                p3_1_log.info(f"[execute_phase_three] Initialized PID buffer for pid={pid}")
+            else:
+                b = buffer_for_process[pid]
+                b["count"] = b.get("count", 0) + 1
+                b["last_time"] = now_epoch
+                if b.get("first_crdt") is None and crDt_msg:
+                    b["first_crdt"] = crDt_msg
+                b.setdefault("messages", []).append(message)
+
+            # --- WS buffer ---
+            if ws_id is not None:
+                if ws_id not in buffer_for_ws:
+                    buffer_for_ws[ws_id] = {
+                        "count": 1,
+                        "first_seen": now_epoch,
+                        "last_time": now_epoch,
+                        "first_crdt": crDt_msg,
+                        "messages": [message],
+                    }
+                    p3_1_log.info(f"[execute_phase_three] Initialized WS buffer for wsId={ws_id}")
+                else:
+                    w = buffer_for_ws[ws_id]
+                    w["count"] = w.get("count", 0) + 1
+                    w["last_time"] = now_epoch
+                    if w.get("first_crdt") is None and crDt_msg:
+                        w["first_crdt"] = crDt_msg
+                    w.setdefault("messages", []).append(message)
+
+            # -----------------------------------------------------------------
+            # PID-level trigger + tasks
+            # -----------------------------------------------------------------
+            if pid in buffer_for_process:
+                b = buffer_for_process[pid]
+                fire_pid, pid_cnt, pid_time_lapsed = _should_fire(
+                    b, PID_COUNT_THRESHOLD, PID_TIME_THRESHOLD, now_epoch
                 )
-                message["output_stock_no"] = st_no
-                message["output_stock_name"] = st_nm
 
-                message["operationname"] = message.get("opNm")
-                message["operationno"] = message.get("opNo")
-                message["operationtaskcode"] = message.get("opTc")
-
-                # DW raw table'a tek satır kaydet
-                _ = dw_tbl_raw_data.saveData(message)  # her şey buna göre set edilmiş
-
-                
-                # Belirli müşteri skip
-                """if message.get("outVals") and message["outVals"][0].get("cust") == "teknia_group":
-                    p3_1_log.info("[execute_phase_three] Skipping teknia_group customer")
-                    continue
-
-                if message.get("plId") and message["plId"] == 20:
-                    p3_1_log.info("[execute_phase_three] Skipping Savola customer")
-                    continue
-
-                if message.get("plId") and message["plId"] == 162:
-                    p3_1_log.info("[execute_phase_three] Skipping Meriç customer")
-                    continue
-                
-                if message.get("prodList") and message["prodList"][0].get("stNo") == "Antares PV":
-                    p3_1_log.info("[execute_phase_three] Skipping Antares PV stock")
-                    continue
-
-                if message.get("prodList") and message["prodList"][0].get("stNo") == "Loperamide 2 mg granulate":
-                    p3_1_log.info("[execute_phase_three] Skipping Loperamide 2 mg granulate stock")
-                    continue"""
-                
-                plant = message.get("plId")
-                wsSt = message["prSt"]
-                pid = message["joOpId"]
-                ws_id = message.get("wsId")
-                crDt_msg = _to_dt(message.get("crDt"))
-                now_epoch = time.time()
-
-                cnt = buffer_for_process.get(pid, {}).get("count", 0)
                 p3_1_log.info(
-                    f"[execute_phase_three] Initializing for -- plId={plant}, prod={message.get('refNo')}, pid={pid}, wsId={ws_id}, "
-                    f"wsSt={wsSt}, In Buffer={pid in buffer_for_process}, count={cnt}"
+                    f"[execute_phase_three] PID buffer pid={pid} count={pid_cnt}, time_lapsed={pid_time_lapsed}"
                 )
 
-                # --- PID buffer yönetimi ---
-                if wsSt == "PRODUCTION":
-                    if pid not in buffer_for_process:
-                        buffer_for_process[pid] = {
-                            "count": 1,
-                            "first_seen": now_epoch,
-                            "last_time": now_epoch,
-                            "first_crdt": crDt_msg,
-                            "messages": [message],
-                        }
-                        p3_1_log.info(f"[execute_phase_three] Initialized PID buffer for pid={pid}")
-                    else:
-                        b = buffer_for_process[pid]
-                        b["count"] = b.get("count", 0) + 1
-                        b["last_time"] = now_epoch
-                        if b.get("first_crdt") is None and crDt_msg:
-                            b["first_crdt"] = crDt_msg
-                        # mesajı buffer'a ekle
-                        b.setdefault("messages", []).append(message)
+                if fire_pid:
+                    batch_id = message.get("prod_order_reference_no") or message.get("refNo")
+                    op_tc = message.get("operationtaskcode") or message.get("opTc")
+                    stock_no = message.get("output_stock_no")
+                    ws_id_current = message.get("wsId")
 
-                # --- WS buffer yönetimi ---
-                if wsSt == "PRODUCTION" and ws_id is not None:
-                    if ws_id not in buffer_for_ws:
-                        buffer_for_ws[ws_id] = {
-                            "count": 1,
-                            "first_seen": now_epoch,
-                            "last_time": now_epoch,
-                            "first_crdt": crDt_msg,
-                            "messages": [message],
-                        }
-                        p3_1_log.info(f"[execute_phase_three] Initialized WS buffer for wsId={ws_id}")
-                    else:
-                        w = buffer_for_ws[ws_id]
-                        w["count"] = w.get("count", 0) + 1
-                        w["last_time"] = now_epoch
-                        if w.get("first_crdt") is None and crDt_msg:
-                            w["first_crdt"] = crDt_msg
-                        w.setdefault("messages", []).append(message)
+                    op_tc = None if op_tc in (None, "", "None") else str(op_tc)
+                    stock_no = None if stock_no in (None, "", "None", "nan", "NaN") else str(stock_no)
 
-                # --- PID / WS için threshold check ---
-                if wsSt == "PRODUCTION":
-                    # ---------- PID-LEVEL CHECK ----------
-                    if pid in buffer_for_process:
-                        b = buffer_for_process[pid]
-                        fire_pid, pid_cnt, pid_time_lapsed = _should_fire(
-                            b, PID_COUNT_THRESHOLD, PID_TIME_THRESHOLD, now_epoch
+                    p3_1_log.info(
+                        f"[execute_phase_three] PID={pid} FIRE -> fetching data for op_tc={op_tc}, stock={stock_no}, ws_id={ws_id_current}"
+                    )
+
+                    # (1) DW snapshot by op_tc + stock (NOT by pid)
+                    job_ids, dates, ids, sensor_values_pid = fetch_for_optc_stock_via_dw(
+                        rows,
+                        input_list,
+                        output_list,
+                        _batch,
+                        op_tc=op_tc,
+                        stock_no=stock_no,
+                        ws_id=ws_id,
+                        pid=None,
+                        prod_order_reference_no=batch_id,   # <-- ADD
+                        max_rows=20000,
+                    )
+
+                    # (2) RAW_TABLE fallback
+                    if not sensor_values_pid:
+                        p3_1_log.info(
+                            f"[execute_phase_three] pid={pid} — DW returned 0 bundles; trying RAW_TABLE fallback"
                         )
+                        job_ids_pid, dates_pid, ids_pid, sensor_values_pid = fetch_latest_for_optc_stock_via_raw_table(
+                            op_tc=op_tc,
+                            stock_no=stock_no,
+                            ws_id=ws_id_current,
+                            pid=None,
+                            prod_order_reference_no=batch_id,
+                            max_rows=20_000,
+                        )
+
+                    # (3) Buffer fallback: scan all PID buffers
+                    if not sensor_values_pid:
+                        all_buffered_messages = []
+                        for _pid, buf_entry in buffer_for_process.items():
+                            all_buffered_messages.extend(buf_entry.get("messages", []))
 
                         p3_1_log.info(
-                            f"[execute_phase_three] Pid={pid}, wsId={ws_id}, wsSt={wsSt} "
-                            f"Updated PID buffer count={pid_cnt}, time_lapsed={pid_time_lapsed}"
+                            f"[execute_phase_three] pid={pid} — RAW_TABLE returned 0; trying buffer fallback (total_buffered_messages={len(all_buffered_messages)})"
+                        )
+                        job_ids_pid, dates_pid, ids_pid, sensor_values_pid = build_sensor_values_from_buffer_for_optc_stock(
+                            all_buffered_messages,
+                            op_tc=op_tc,
+                            stock_no=stock_no,
+                            ws_id=ws_id_current,
+                            pid=None,
+                            prod_order_reference_no=batch_id,
                         )
 
-                        if fire_pid:
-                            # Extract current message's op_tc and stock
-                            op_tc = message.get("operationtaskcode") or message.get("opTc")
-                            stock_no = message.get("output_stock_no")
-                            ws_id_current = message.get("wsId")
-                            
-                            # Clean them
-                            op_tc = None if op_tc in (None, "", "None") else str(op_tc)
-                            stock_no = None if stock_no in (None, "", "None", "nan", "NaN") else str(stock_no)
-                            
-                            p3_1_log.info(
-                                f"[execute_phase_three] PID={pid} FETCHING DATA for op_tc={op_tc}, "
-                                f"stock={stock_no}, ws_id={ws_id_current}"
+                    if not sensor_values_pid:
+                        p3_1_log.info(
+                            f"[execute_phase_three] pid={pid} — no data after DW+RAW+buffer for op_tc={op_tc}, stock={stock_no}; skipping"
+                        )
+                    else:
+                        p3_1_log.info(
+                            f"[execute_phase_three] pid={pid} fetched points={len(dates_pid)} for op_tc={op_tc}, stock={stock_no}"
+                        )
+                        try:
+                            _run_3_tasks_and_wait(
+                                sensor_values=sensor_values_pid,
+                                message=message,
+                                dates=dates_pid,
+                                input_list=input_list,
+                                output_list=output_list,
+                                p3_1_log=p3_1_log,
+                                scope="pid",
+                                scope_id=pid,
+                                corr_group_by_output_stock=False,
+                                pred_group_by_stock=True,
+                                pred_algorithm="RANDOM_FOREST",
+                                pred_epochs=125,
+                                pred_min_train_points=250,
+                                fi_algorithm="XGBOOST",
                             )
-                            
-                            # === (1) DW SNAPSHOT - by op_tc + stock (NOT by PID!) ===
-                            job_ids_pid, dates_pid, ids_pid, sensor_values_pid = fetch_for_optc_stock_via_dw(
-                                rows, input_list, output_list, _batch,
-                                op_tc=op_tc,
-                                stock_no=stock_no,
-                                ws_id=ws_id_current,  # opsiyonel: sadece bu workstation
-                                pid=None,              # ✅ PID filtresi YOK - tüm PID'ler gelsin
-                                max_rows=20_000
+                        except Exception as e:
+                            p3_1_log.error(
+                                f"[execute_phase_three] PID parallel runner failed for pid={pid}: {e}",
+                                exc_info=True
                             )
-                            
-                            # === (2) RAW_TABLE FALLBACK ===
-                            if not sensor_values_pid:
-                                p3_1_log.info(
-                                    f"[execute_phase_three] pid={pid} — DW returned 0 bundles; "
-                                    f"trying RAW_TABLE fallback"
-                                )
-                                job_ids_pid, dates_pid, ids_pid, sensor_values_pid = fetch_latest_for_optc_stock_via_raw_table(
-                                    op_tc=op_tc,
-                                    stock_no=stock_no,
-                                    ws_id=ws_id_current,
-                                    pid=None,  # ✅ PID filtresi YOK
-                                    max_rows=20_000
-                                )
-                            
-                            # === (3) BUFFER FALLBACK ===
-                            if not sensor_values_pid:
-                                # Burada buffer'dan çekerken TÜM buffer'ı tara (sadece PID buffer değil)
-                                all_buffered_messages = []
-                                for buffered_pid, buf_entry in buffer_for_process.items():
-                                    all_buffered_messages.extend(buf_entry.get("messages", []))
-                                
-                                buffered_n = len(all_buffered_messages)
-                                p3_1_log.info(
-                                    f"[execute_phase_three] pid={pid} — RAW_TABLE returned 0 bundles; "
-                                    f"trying buffer fallback (total_buffered_messages={buffered_n})"
-                                )
-                                
-                                job_ids_pid, dates_pid, ids_pid, sensor_values_pid = build_sensor_values_from_buffer_for_optc_stock(
-                                    all_buffered_messages,
-                                    op_tc=op_tc,
-                                    stock_no=stock_no,
-                                    ws_id=ws_id_current,
-                                    pid=None  # ✅ PID filtresi YOK
-                                )
-                            
-                            if not sensor_values_pid:
-                                p3_1_log.info(
-                                    f"[execute_phase_three] pid={pid} — still no data after "
-                                    f"DW+RAW+buffer for op_tc={op_tc}, stock={stock_no}; skipping"
-                                )
-                                continue
-                            
-                            # ✅ Artık sensor_values_pid, AYNI op_tc + stock kombinasyonuna sahip
-                            #    TÜM PID'lerden gelen datayı içerir
-                            
-                            p3_1_log.info(
-                                f"[execute_phase_three] Fetched {len(dates_pid)} time points "
-                                f"for op_tc={op_tc}, stock={stock_no} (from multiple PIDs)"
+
+                    # Reset PID buffer after firing attempt
+                    b["count"] = 0
+                    b["first_seen"] = b.get("last_time", now_epoch)
+                    b["first_crdt"] = None
+                    b["messages"] = []
+                else:
+                    p3_1_log.info(
+                        f"[execute_phase_three] PID={pid} not firing (cnt={pid_cnt}, elapsed={pid_time_lapsed})"
+                    )
+
+            # -----------------------------------------------------------------
+            # WS-level trigger + tasks
+            # -----------------------------------------------------------------
+            if ws_id is not None and ws_id in buffer_for_ws:
+                w = buffer_for_ws[ws_id]
+                fire_ws, ws_cnt, ws_time_lapsed = _should_fire(
+                    w, WS_COUNT_THRESHOLD, WS_TIME_THRESHOLD, now_epoch
+                )
+
+                p3_1_log.info(
+                    f"[execute_phase_three] WS buffer wsId={ws_id} count={ws_cnt}, time_lapsed={ws_time_lapsed}"
+                )
+
+                if fire_ws:
+                    p3_1_log.info(
+                        f"[execute_phase_three] WS={ws_id} FIRE -> fetching ws-level data (cnt={ws_cnt}, elapsed={ws_time_lapsed})"
+                    )
+
+                    # (1) DW snapshot
+                    job_ids_ws, dates_ws, ids_ws, sensor_values_ws = fetch_latest_for_ws_via_dw(
+                        ws_id, rows, input_list, output_list, _batch, max_rows=20_000
+                    )
+
+                    # (2) RAW_TABLE fallback
+                    if not sensor_values_ws:
+                        p3_1_log.info(
+                            f"[execute_phase_three] wsId={ws_id} — DW returned 0 bundles; trying RAW_TABLE fallback"
+                        )
+                        job_ids_ws, dates_ws, ids_ws, sensor_values_ws = fetch_latest_for_ws_via_raw_table(
+                            ws_id, max_rows=20_000
+                        )
+
+                    # (3) WS buffer fallback
+                    if not sensor_values_ws:
+                        buffered_n = len(w.get("messages", []))
+                        p3_1_log.info(
+                            f"[execute_phase_three] wsId={ws_id} — RAW_TABLE returned 0; trying WS buffer fallback (buffered_messages={buffered_n})"
+                        )
+                        job_ids_ws, dates_ws, ids_ws, sensor_values_ws = build_sensor_values_from_ws_buffer(
+                            ws_id, w.get("messages", [])
+                        )
+
+                    if not sensor_values_ws:
+                        p3_1_log.info(
+                            f"[execute_phase_three] wsId={ws_id} — no data after DW+RAW+buffer; skipping"
+                        )
+                    else:
+                        # Stock gate (avoid mixing stock contexts)
+                        skip_ws = False
+                        current_stock = _clean_stock(message.get("output_stock_no"))
+
+                        if current_stock is None:
+                            p3_1_log.warning(
+                                f"[execute_phase_three] wsId={ws_id} group_by_output_stock=True but current message has no output_stock_no -> skip ws tasks"
                             )
-                            # --- PID: run correlation + prediction + feature-importance in parallel ---
+                            skip_ws = True
+                        else:
+                            has_stock = _sensor_values_has_stock(sensor_values_ws, current_stock)
+                            pts = _count_points_for_stock(sensor_values_ws, current_stock)
+
+                            if (not has_stock) or (pts < 2):
+                                p3_1_log.info(
+                                    f"[execute_phase_three] wsId={ws_id} stock gate: current_stock={current_stock} "
+                                    f"has_stock={has_stock} points={pts} -> skip ws tasks"
+                                )
+                                skip_ws = True
+
+                        if not skip_ws:
                             try:
                                 _run_3_tasks_and_wait(
-                                    sensor_values=sensor_values_pid,
+                                    sensor_values=sensor_values_ws,
                                     message=message,
-                                    dates=dates_pid,
+                                    dates=dates_ws,
                                     input_list=input_list,
                                     output_list=output_list,
                                     p3_1_log=p3_1_log,
-                                    scope="pid",
-                                    scope_id=pid,
-                                    corr_group_by_output_stock=False,   # keep your PID behavior
-                                    pred_group_by_stock=True,          # keep your PID behavior
+                                    scope="ws",
+                                    scope_id=ws_id,
+                                    corr_group_by_output_stock=True,
+                                    pred_group_by_stock=True,
                                     pred_algorithm="RANDOM_FOREST",
                                     pred_epochs=125,
                                     pred_min_train_points=250,
                                     fi_algorithm="XGBOOST",
                                 )
                             except Exception as e:
-                                p3_1_log.error(f"[execute_phase_three] PID parallel runner failed for pid={pid}: {e}", exc_info=True)
-
-
-                            # ---- buffer reset policy ----
-                            # If we skipped due to stock gate, DON'T clear the PID buffer,
-                            # so the next message can trigger again quickly.
-                            b["count"] = 0
-                            b["first_seen"] = b["last_time"]
-                            b["first_crdt"] = None
-                            b["messages"] = []
-
-                        else:
-                            p3_1_log.info(
-                                f"[execute_phase_three] Pid={pid}, wsId={ws_id}, wsSt={wsSt} "
-                                f"SKIPPING PID-level Correlation (cnt={pid_cnt}, elapsed={pid_time_lapsed})"
-                            )
-
-                    # ---------- WS-LEVEL CHECK (AGGREGATED) ----------
-                    if ws_id is not None and ws_id in buffer_for_ws:
-                        w = buffer_for_ws[ws_id]
-                        fire_ws, ws_cnt, ws_time_lapsed = _should_fire(
-                            w, WS_COUNT_THRESHOLD, WS_TIME_THRESHOLD, now_epoch
-                        )
-
-                        p3_1_log.info(
-                            f"[execute_phase_three] wsId={ws_id}, wsSt={wsSt} "
-                            f"Updated WS buffer count={ws_cnt}, time_lapsed={ws_time_lapsed}"
-                        )
-
-                        if fire_ws:
-                            p3_1_log.info(
-                                f"[execute_phase_three] Fetching WS-level raw data for wsId={ws_id} "
-                                f"(cnt={ws_cnt}, elapsed={ws_time_lapsed})"
-                            )
-
-                            # (1) DW SNAPSHOT
-                            job_ids_ws, dates_ws, ids_ws, sensor_values_ws = fetch_latest_for_ws_via_dw(
-                                ws_id, rows, input_list, output_list, _batch, max_rows=20_000
-                            )
-
-                            # (2) RAW_TABLE FALLBACK
-                            if not sensor_values_ws:
-                                p3_1_log.info(f"[execute_phase_three] wsId={ws_id} — DW returned 0 bundles; trying RAW_TABLE fallback")
-                                job_ids_ws, dates_ws, ids_ws, sensor_values_ws = fetch_latest_for_ws_via_raw_table(
-                                    ws_id, max_rows=20_000
+                                p3_1_log.error(
+                                    f"[execute_phase_three] WS parallel runner failed for wsId={ws_id}: {e}",
+                                    exc_info=True
                                 )
 
-                            # (3) WS BUFFER FALLBACK
-                            if not sensor_values_ws:
-                                buffered_n = len(w.get("messages", []))
-                                p3_1_log.info(f"[execute_phase_three] wsId={ws_id} — RAW_TABLE returned 0 bundles; trying WS buffer fallback (buffered_messages={buffered_n})")
-                                job_ids_ws, dates_ws, ids_ws, sensor_values_ws = build_sensor_values_from_ws_buffer(
-                                    ws_id, w.get("messages", [])
-                                )
+                            # Reset WS buffer on run
+                            w["count"] = 0
+                            w["first_seen"] = w.get("last_time", now_epoch)
+                            w["first_crdt"] = None
+                            w["messages"] = []
+                        # else: keep WS buffer so next message can re-trigger correctly
 
-                            if not sensor_values_ws:
-                                p3_1_log.info(f"[execute_phase_three] wsId={ws_id} — still no data after DW+RAW+buffer; skipping")
-                                continue
-                            else:
-                                # ---- STOCK GATE (WS + group_by_output_stock) ----
-                                skip_ws = False
-                                current_stock = _clean_stock(message.get("output_stock_no"))
-
-                                if current_stock is None:
-                                    p3_1_log.warning(
-                                        f"[execute_phase_three] wsId={ws_id} group_by_output_stock=True but current message has no output_stock_no. "
-                                        "Skipping WS correlation/LSTM/feature-importance to avoid mixing stocks."
-                                    )
-                                    skip_ws = True
-                                else:
-                                    has_stock = _sensor_values_has_stock(sensor_values_ws, current_stock)
-                                    pts = _count_points_for_stock(sensor_values_ws, current_stock)
-
-                                    if (not has_stock) or (pts < 2):
-                                        p3_1_log.info(
-                                            f"[execute_phase_three] wsId={ws_id} stock gate: current_stock={current_stock} "
-                                            f"has_stock={has_stock} points={pts} (<2 or missing). "
-                                            "Skipping WS correlation/LSTM/feature-importance; waiting for next message."
-                                        )
-                                        skip_ws = True
-
-                                if not skip_ws:
-                                    # --- WS: run correlation + prediction + feature-importance in parallel ---
-                                    try:
-                                        _run_3_tasks_and_wait(
-                                            sensor_values=sensor_values_ws,   # (NOTE) use what you already feed to correlation/fi
-                                            message=message,
-                                            dates=dates_ws,
-                                            input_list=input_list,
-                                            output_list=output_list,
-                                            p3_1_log=p3_1_log,
-                                            scope="ws",
-                                            scope_id=ws_id,
-                                            corr_group_by_output_stock=True,  # keep your WS behavior
-                                            pred_group_by_stock=True,         # keep your WS behavior
-                                            pred_algorithm="RANDOM_FOREST",
-                                            pred_epochs=125,
-                                            pred_min_train_points=250,
-                                            fi_algorithm="XGBOOST",
-                                        )
-                                    except Exception as e:
-                                        p3_1_log.error(f"[execute_phase_three] WS parallel runner failed for wsId={ws_id}: {e}", exc_info=True)
-
-                                # ---- WS buffer reset policy ----
-                                if not skip_ws:
-                                    w["count"] = 0
-                                    w["first_seen"] = w["last_time"]
-                                    w["first_crdt"] = None
-                                    w["messages"] = []
-                                else:
-                                    # keep buffer so next message can re-trigger and fetch includes the stock
-                                    pass
-
-
-                        else:
-                            p3_1_log.info(
-                                f"[execute_phase_three] wsId={ws_id}, wsSt={wsSt} "
-                                f"SKIPPING WS-level Correlation (cnt={ws_cnt}, elapsed={ws_time_lapsed})"
-                            )
-
-                # PRODUCTION değilse PID / WS bufferları temizle
                 else:
                     p3_1_log.info(
-                        f"[execute_phase_three] pid={pid}, wsId={ws_id}, ws not in PRODUCTION, "
-                        f"clearing buffers, wsSt={wsSt}"
+                        f"[execute_phase_three] wsId={ws_id} not firing (cnt={ws_cnt}, elapsed={ws_time_lapsed})"
                     )
-                    buffer_for_process.pop(pid, None)
-                    if ws_id is not None:
-                        buffer_for_ws.pop(ws_id, None)
 
+        else:
+            batch_id = str(message.get("prod_order_reference_no") or message.get("refNo") or message.get("joRef") or "0")
+            last_prod = _LAST_PROD_MESSAGE_BY_BATCH.get(batch_id)
+            batch_msgs = _BATCH_MESSAGE_BUFFER.get(batch_id, [])
 
-            except Exception as e2:
-                p3_1_log.error(f"[execute_phase_three] Error Level 2: {e2}", exc_info=True)
+            try:
+                fin = finalize_batch_prediction(
+                    batch_id=batch_id,
+                    last_prod_message=last_prod,
+                    batch_messages=batch_msgs,
+                    p3_1_log=p3_1_log
+                )
+                p3_1_log.info(f"[execute_phase_three] finalize_batch_prediction status={fin}")
+            except Exception as e:
+                p3_1_log.error(f"[execute_phase_three] finalize_batch_prediction failed: {e}", exc_info=True)
 
-    except Exception as e1:
-        p3_1_log.error(f"[execute_phase_three] Error Level 1: {e1}", exc_info=True)
+            # cleanup
+            _BATCH_MESSAGE_BUFFER.pop(batch_id, None)
+            _LAST_PROD_MESSAGE_BY_BATCH.pop(batch_id, None)
+
+            p3_1_log.info(
+                f"[execute_phase_three] ws not in PRODUCTION -> clearing buffers pid={pid}, wsId={ws_id}, wsSt={wsSt}"
+            )
+            buffer_for_process.pop(pid, None)
+            if ws_id is not None:
+                buffer_for_ws.pop(ws_id, None)
 
 
 import queue
@@ -2019,9 +2461,9 @@ def _run_3_tasks_and_wait(
     # correlation
     corr_group_by_output_stock: bool,
     corr_algorithm: str = "SPEARMAN",
-    # prediction
-    pred_group_by_stock: bool,
-    pred_algorithm: str = "LSTM",
+    # prediction (DISABLED HERE; fast path handles per-message prediction)
+    pred_group_by_stock: bool = True,
+    pred_algorithm: str = "RANDOM_FOREST",
     pred_lookback: int = 20,
     pred_epochs: int = 50,
     pred_min_train_points: int = 250,
@@ -2032,8 +2474,11 @@ def _run_3_tasks_and_wait(
     fi_drop_cols=("ts", "joOpId", "wsId"),
 ):
     """
-    Runs (1) correlation, (2) realtime prediction, (3) feature importance in parallel threads.
-    Waits until all complete. Exceptions are logged; main loop continues safely.
+    Runs (1) correlation, (2) feature importance in parallel threads.
+    NOTE: Realtime prediction is intentionally DISABLED here because we now run
+    prediction for EVERY Kafka message in execute_phase_three() (FAST_PRED path).
+
+    This keeps correlation + FI periodic, while prediction is always-on.
     """
     err_q = queue.Queue()
 
@@ -2056,101 +2501,7 @@ def _run_3_tasks_and_wait(
             group_by_output_stock=corr_group_by_output_stock,
         )
 
-    # ---- task 2: realtime prediction ----
-    def _task_prediction():
-
-        if PREDICTION_SCOPE_MODE == "batch":
-            batch_id = (
-                message.get("prod_order_reference_no")
-                or message.get("joRef")
-                or message.get("refNo")
-                or "0"
-            )
-            # Use the buffered history (already corresponds to the current scope window)
-            _, hist_out = history_from_fetch(dates, sensor_values)
-            seed = hist_out
-
-            res = handle_realtime_prediction(
-                message=message,
-                lookback=pred_lookback,
-                epochs=pred_epochs,
-                min_train_points=pred_min_train_points,
-                p3_1_log=p3_1_log,
-                algorithm=pred_algorithm,
-                seed_history=seed,
-                scope="batch",
-                scope_id=str(batch_id),
-                group_by_stock=True,
-                resample_seconds=RESAMPLE_SECONDS,
-            )
-
-        elif scope == "pid":
-            op_tc = message.get("operationtaskcode") or message.get("opTc")
-            stock_no = message.get("output_stock_no") or (
-                (message.get("prodList") or [{}])[0].get("stNo")
-                if isinstance(message.get("prodList"), list) else None
-            )
-
-            # DATASET: RAW_TABLE’da opTc + stock (+ ws) eşleşen tüm rowlar
-            _, dates_rt, _, sv_rt = fetch_latest_for_optc_stock_via_raw_table(
-                op_tc=str(op_tc) if op_tc not in (None, "", "None") else None,
-                stock_no=str(stock_no) if stock_no not in (None, "", "None", "nan", "NaN") else None,
-                max_rows=20000,
-                ws_id=message.get("wsId")
-                # pid=message.get("joOpId"),  # istersen aç
-            )
-
-            if not sv_rt:
-                p3_1_log.warning(
-                    f"[prediction] RAW_TABLE returned 0 rows for opTc={op_tc}, stock={stock_no}. "
-                    f"Falling back to in-memory sensor_values (mix risk)."
-                )
-                hist_in, hist_out = history_from_fetch(dates, sensor_values)
-            else:
-                p3_1_log.info(
-                    f"[prediction] Fetched {len(dates_rt)} time points from RAW_TABLE for "
-                    f"opTc={op_tc}, stock={stock_no}."
-                )
-                hist_in, hist_out = history_from_fetch(dates_rt, sv_rt)
-
-            # seed_history olarak SADECE OUTPUT geçmişini ver
-            seed = hist_out
-
-            res = handle_realtime_prediction(
-                message=message,
-                lookback=(pred_lookback // 2),
-                epochs=pred_epochs,
-                min_train_points=pred_min_train_points,
-                p3_1_log=p3_1_log,
-                algorithm=pred_algorithm,
-                seed_history=seed,
-                scope="pid",
-                scope_id=scope_id,   # joOpId (pid) kalsın
-                group_by_stock=True  # key = OPTC_<opTc>_WS_<wsId>_ST_<stock>_OUTPUT / INPUT
-            )
-
-        else:
-            # WS tarafı: aynı mantık, yine sadece OUTPUT history seed
-            hist_in, hist_out = history_from_fetch(dates, sensor_values)
-            seed = hist_out
-
-            res = handle_realtime_prediction(
-                message=message,
-                lookback=pred_lookback,
-                epochs=pred_epochs,
-                min_train_points=pred_min_train_points,
-                p3_1_log=p3_1_log,
-                algorithm=pred_algorithm,
-                seed_history=seed,
-                scope=scope,
-                scope_id=scope_id,
-                group_by_stock=pred_group_by_stock,
-            )
-
-        p3_1_log.info(f"[execute_phase_three] {scope}-level realtime_prediction status={res}")
-
-
-    # ---- task 3: feature importance ----
+    # ---- task 2: feature importance ----
     def _task_feature_importance():
         compute_and_save_feature_importance(
             sensor_values,
@@ -2166,21 +2517,16 @@ def _run_3_tasks_and_wait(
             scope_id=scope_id,
         )
 
-    # Start 3 threads
     t1 = threading.Thread(target=lambda: _wrap("correlation", _task_correlation), daemon=True)
-    t2 = threading.Thread(target=lambda: _wrap("realtime_prediction", _task_prediction), daemon=True)
-    t3 = threading.Thread(target=lambda: _wrap("feature_importance", _task_feature_importance), daemon=True)
+    t2 = threading.Thread(target=lambda: _wrap("feature_importance", _task_feature_importance), daemon=True)
 
     start = time.time()
-    t1.start(); t2.start(); t3.start()
-
-    # Wait all
+    t1.start()
+    t2.start()
     t1.join()
     t2.join()
-    t3.join()
     elapsed = time.time() - start
 
-    # Log any errors (don’t crash the main loop)
     had_err = False
     while not err_q.empty():
         had_err = True

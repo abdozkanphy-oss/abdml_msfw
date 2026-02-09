@@ -179,8 +179,8 @@ def build_dataset(sensor_values: Dict[str, List[Any]],
     # keep numeric only
     X = (X.select_dtypes(include=[np.number])
            .replace([np.inf, -np.inf], np.nan)
-           .fillna(method="ffill")
-           .fillna(method="bfill"))
+           .ffill()
+           .bfill())
 
     if X.shape[1] == 0 or X.shape[0] < 1:
         raise ValueError("Not enough numeric features/rows for feature-importance.")
@@ -196,8 +196,8 @@ def compute_perm_importance(X: pd.DataFrame, y: np.ndarray, random_state: int = 
 
     X = (X.select_dtypes(include=[np.number])
            .replace([np.inf, -np.inf], np.nan)
-           .fillna(method="ffill")
-           .fillna(method="bfill"))
+           .ffill()
+           .bfill())
 
     if X.shape[0] < 1:
         return {}
@@ -245,8 +245,8 @@ def compute_xgb_importance(
     # Sadece numerik kolonlar + basic temizlik
     X = (X.select_dtypes(include=[np.number])
            .replace([np.inf, -np.inf], np.nan)
-           .fillna(method="ffill")
-           .fillna(method="bfill"))
+           .ffill()
+           .bfill())
 
     if X.shape[0] < 5:
         # çok az satır varsa model zaten anlamlı olmaz

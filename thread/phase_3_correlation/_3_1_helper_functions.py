@@ -885,7 +885,7 @@ def compute_correlation(
         X = df[feature_cols].apply(pd.to_numeric, errors="coerce")
 
         # --- minimal time alignment ---
-        if scope == "ws":
+        if scope in ("ws", "pid", "batch"):
             X = X.ffill(limit=1)
 
         # drop all-null

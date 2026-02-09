@@ -1,3 +1,4 @@
+import os
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -17,8 +18,6 @@ if not logger.hasHandlers():
 
     # Handler'ı logger'a ekleme
     logger.addHandler(file_handler)
-    
-    
     
     
 info_logger = logging.getLogger("info_logger")
@@ -211,6 +210,37 @@ if not ph2_logger.hasHandlers():
     ph2_logger.addHandler(handler)
 
 
+def get_p3_1_logger(
+    name: str = "p3_1_log",
+    log_file: str = "logs/p3_1_live.log",
+    level: int = logging.DEBUG,
+) -> logging.Logger:
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.propagate = False
+
+    # Prevent duplicate handlers if imported multiple times
+    if getattr(logger, "_configured", False):
+        return logger
+
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    # File handler (rotating)
+    fh = RotatingFileHandler(log_file, maxBytes=10_000_000, backupCount=5, encoding="utf-8")
+    fh.setLevel(level)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(level)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    logger._configured = True
+    return logger
 
 
 # import logging

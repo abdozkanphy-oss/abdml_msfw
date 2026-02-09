@@ -1,9 +1,21 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE configs
+.idea/
+.vscode/
+
+# Project configs
+data/*
+models/*
+logs/*
+logs/*.zip
+tables
+tools
 .venv/
-# logs/
-__pycache__
-/logs/*
 venv/
-thread/__pycache__
-.keras
-.pkl
-.xlsx
